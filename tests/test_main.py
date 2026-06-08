@@ -1,8 +1,8 @@
 import importlib
 import inspect
+import os
 import socket
 import sys
-from logging import WARNING
 from pathlib import Path
 
 import httpx
@@ -14,9 +14,8 @@ from uvicorn import Server
 from uvicorn._types import ASGIReceiveCallable, ASGISendCallable, Scope
 from uvicorn.config import Config
 from uvicorn.main import run
-from uvicorn.supervisors import Multiprocess
 
-pytestmark = pytest.mark.anyio
+pytestmark = pytest.mark.tonio
 
 
 async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
@@ -54,59 +53,11 @@ def _has_ipv6(host: str):
     ],
 )
 async def test_run(host, url: str, unused_tcp_port: int):
-    config = Config(app=app, host=host, loop="asyncio", limit_max_requests=1, port=unused_tcp_port)
+    config = Config(app=app, host=host, limit_max_requests=1, port=unused_tcp_port)
     async with run_server(config):
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{url}:{unused_tcp_port}")
+        with httpx.Client() as client:
+            response = client.get(f"{url}:{unused_tcp_port}")
     assert response.status_code == 204
-
-
-async def test_run_multiprocess(unused_tcp_port: int):
-    config = Config(app=app, loop="asyncio", workers=2, limit_max_requests=1, port=unused_tcp_port)
-    async with run_server(config):
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"http://127.0.0.1:{unused_tcp_port}")
-    assert response.status_code == 204
-
-
-async def test_run_reload(unused_tcp_port: int):
-    config = Config(app=app, loop="asyncio", reload=True, limit_max_requests=1, port=unused_tcp_port)
-    async with run_server(config):
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"http://127.0.0.1:{unused_tcp_port}")
-    assert response.status_code == 204
-
-
-def test_run_invalid_app_config_combination(caplog: pytest.LogCaptureFixture) -> None:
-    with pytest.raises(SystemExit) as exit_exception:
-        run(app, reload=True)
-    assert exit_exception.value.code == 1
-    assert caplog.records[-1].name == "uvicorn.error"
-    assert caplog.records[-1].levelno == WARNING
-    assert caplog.records[-1].message == (
-        "You must pass the application as an import string to enable 'reload' or 'workers'."
-    )
-
-
-def test_run_fails_fast_in_parent_on_bad_app_path(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Bad app path with `--workers > 1` exits in the parent.
-
-    Regression for https://github.com/encode/uvicorn/discussions/2440: without
-    parent-side validation the supervisor restarts dying workers forever.
-    """
-
-    def fail(*args: object, **kwargs: object) -> None:  # pragma: no cover
-        pytest.fail("parent reached supervisor; should have exited on bad app path")
-
-    monkeypatch.setattr(Config, "bind_socket", fail)
-    monkeypatch.setattr(Multiprocess, "run", fail)
-
-    with pytest.raises(SystemExit) as exit_exception:
-        run("tests.test_main:nonexistent_attr", workers=2)
-    assert exit_exception.value.code == 1
-    assert any("Error loading ASGI app" in record.message for record in caplog.records)
 
 
 def test_run_imports_app_before_starting_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -143,16 +94,30 @@ def test_run_imports_app_before_starting_event_loop(tmp_path: Path, monkeypatch:
     assert imported_before_server_run == [True]
 
 
-def test_run_startup_failure(caplog: pytest.LogCaptureFixture) -> None:
-    async def app(scope, receive, send):
-        assert scope["type"] == "lifespan"
-        message = await receive()
-        if message["type"] == "lifespan.startup":
-            raise RuntimeError("Startup failed")
+def test_run_startup_failure(tmp_path: Path) -> None:
+    """Run in a subprocess: `run()` calls tonio.run which can't re-init the
+    runtime owned by the pytest plugin."""
+    import subprocess
 
-    with pytest.raises(SystemExit) as exit_exception:
-        run(app, lifespan="on")
-    assert exit_exception.value.code == 3
+    script = tmp_path / "boot.py"
+    script.write_text(
+        "from uvicorn.main import run\n"
+        "async def app(scope, receive, send):\n"
+        "    msg = await receive()\n"
+        "    if msg['type'] == 'lifespan.startup':\n"
+        "        raise RuntimeError('Startup failed')\n"
+        "run(app, lifespan='on', port=0)\n"
+    )
+    env = dict(os.environ)
+    env.setdefault("PYTHON_GIL", "0")
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 3, (result.returncode, result.stdout, result.stderr)
 
 
 def test_run_match_config_params() -> None:

@@ -1,55 +1,49 @@
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import functools
 import logging
 import os
-import platform
 import random
 import signal
 import socket
+import ssl as _ssl
 import sys
 import threading
 import time
-from collections.abc import Generator, Sequence
+from collections.abc import Sequence
 from email.utils import formatdate
-from types import FrameType
-from typing import TYPE_CHECKING, TypeAlias
 
 import click
+import tonio
+import tonio.colored
+import tonio.colored.net
+import tonio.colored.signals
+import tonio.colored.time
+from tonio._colored._net._socket import from_stdlib_socket
+from tonio.colored.net import SocketListener, SocketStream
+from tonio.colored.net.tls import TLSStream
 
-from uvicorn._compat import asyncio_run
 from uvicorn.config import Config
 
-if TYPE_CHECKING:
-    from uvicorn.protocols.http.h11_impl import H11Protocol
-    from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
-    from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol
-    from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
-    from uvicorn.protocols.websockets.wsproto_impl import WSProtocol
-
-    Protocols: TypeAlias = H11Protocol | HttpToolsProtocol | WSProtocol | WebSocketProtocol | WebSocketsSansIOProtocol
-
-HANDLED_SIGNALS = (
-    signal.SIGINT,  # Unix signal 2. Sent by Ctrl+C.
-    signal.SIGTERM,  # Unix signal 15. Sent by `kill <pid>`.
+HANDLED_SIGNALS: tuple[int, ...] = (
+    signal.SIGINT,
+    signal.SIGTERM,
 )
-if sys.platform == "win32":  # pragma: py-not-win32
-    HANDLED_SIGNALS += (signal.SIGBREAK,)  # Windows signal 21. Sent by Ctrl+Break.
 
 logger = logging.getLogger("uvicorn.error")
 
 
 class ServerState:
-    """
-    Shared servers state that is available between all protocol instances.
-    """
+    """Shared server state available to all connection handlers."""
 
     def __init__(self) -> None:
         self.total_requests = 0
-        self.connections: set[Protocols] = set()
-        self.tasks: set[asyncio.Task[None]] = set()
+        # id(stream) -> underlying stdlib socket for every in-flight connection.
+        # dict add/del is atomic under free-threaded CPython, so no lock is
+        # needed. Used by handlers for `limit_concurrency` and by Server's
+        # graceful-shutdown drain.
+        self.connections: dict[int, socket.socket] = {}
         self.default_headers: list[tuple[bytes, bytes]] = []
 
 
@@ -64,6 +58,13 @@ class Server:
         self.last_notified = 0.0
 
         self._captured_signals: list[int] = []
+        self.listeners: list[SocketListener] = []
+        self._ssl_context: _ssl.SSLContext | None = None
+        self._exit_ev = tonio.colored.Event()
+
+        # Set when server_state.connections becomes empty; cleared on add.
+        self._all_handlers_done = tonio.colored.Event()
+        self._all_handlers_done.set()
 
     @functools.cached_property
     def limit_max_requests(self) -> int | None:
@@ -72,11 +73,25 @@ class Server:
         return self.config.limit_max_requests + random.randint(0, self.config.limit_max_requests_jitter)
 
     def run(self, sockets: list[socket.socket] | None = None) -> None:
-        return asyncio_run(self.serve(sockets=sockets), loop_factory=self.config.get_loop_factory())
+        threads = self.config.threads if self.config.threads and self.config.threads > 0 else None
+        # Tonio's runtime installs signal handlers via signal.set_wakeup_fd, which
+        # requires the main thread. When Server.run is invoked from a worker
+        # thread (e.g. test harnesses), skip signal registration.
+        signals = list(HANDLED_SIGNALS) if threading.current_thread() is threading.main_thread() else []
+        try:
+            return tonio.run(
+                self.serve(sockets=sockets),
+                threads=threads,
+                signals=signals,
+            )
+        finally:
+            # Re-raise captured signals after the runtime has restored the default
+            # handlers, so a wrapping shell sees e.g. KeyboardInterrupt on Ctrl-C.
+            for captured_signal in reversed(self._captured_signals):
+                signal.raise_signal(captured_signal)
 
     async def serve(self, sockets: list[socket.socket] | None = None) -> None:
-        with self.capture_signals():
-            await self._serve(sockets)
+        await self._serve(sockets)
 
     async def _serve(self, sockets: list[socket.socket] | None = None) -> None:
         process_id = os.getpid()
@@ -87,19 +102,63 @@ class Server:
 
         self.lifespan = config.lifespan_class(config)
 
+        # toncorn banner: identify the fork + the upstream uvicorn version it tracks.
+        import toncorn as _toncorn
+
+        banner = "toncorn %s (uvicorn %s)" % (_toncorn.__version__, _toncorn.uvicorn_version)
+        color_banner = click.style(banner, bold=True)
+        logger.info(banner, extra={"color_message": color_banner})
+
         message = "Started server process [%d]"
         color_message = "Started server process [" + click.style("%d", fg="cyan") + "]"
         logger.info(message, process_id, extra={"color_message": color_message})
 
         await self.startup(sockets=sockets)
-        if not self.should_exit:
-            await self.main_loop()
-        if self.started:
-            await self.shutdown(sockets=sockets)
 
-            message = "Finished server process [%d]"
-            color_message = "Finished server process [" + click.style("%d", fg="cyan") + "]"
-            logger.info(message, process_id, extra={"color_message": color_message})
+        async def main_work() -> None:
+            if not self.should_exit:
+                try:
+                    await tonio.colored.select(self._run_accept_loops(), self.main_loop())
+                finally:
+                    for listener in self.listeners:
+                        with contextlib.suppress(Exception):
+                            listener.close()
+
+            if self.started:
+                await self.shutdown()
+                finished = "Finished server process [%d]"
+                color_finished = "Finished server process [" + click.style("%d", fg="cyan") + "]"
+                logger.info(finished, process_id, extra={"color_message": color_finished})
+
+        # The signal watcher runs concurrently with main_work so a second SIGINT
+        # received during graceful shutdown can flip `force_exit` and skip the
+        # lifespan shutdown.
+        await tonio.colored.select(main_work(), self._watch_signals())
+
+    async def _watch_signals(self) -> None:
+        """Consume HANDLED_SIGNALS via tonio and update should_exit/force_exit.
+
+        If the runtime wasn't initialized with these signals (e.g. when serve()
+        is driven by the tonio pytest plugin), we fall back to an idle wait so
+        the surrounding `select` keeps waiting on main_work to finish.
+        """
+        try:
+            ctx = tonio.colored.signals.signal_receiver(*HANDLED_SIGNALS)
+        except Exception:
+            await _idle_forever()
+            return
+
+        try:
+            with ctx as recv:
+                async for sig in recv:
+                    self._captured_signals.append(sig)
+                    if self.should_exit and sig == signal.SIGINT:
+                        self.force_exit = True  # pragma: full coverage
+                    else:
+                        self.should_exit = True
+                        self._exit_ev.set()
+        except Exception:
+            await _idle_forever()
 
     async def startup(self, sockets: list[socket.socket] | None = None) -> None:
         await self.lifespan.startup()
@@ -108,117 +167,73 @@ class Server:
             return
 
         config = self.config
+        self._ssl_context = config.ssl
 
-        def create_protocol(
-            _loop: asyncio.AbstractEventLoop | None = None,
-        ) -> asyncio.Protocol:
-            return config.http_protocol_class(  # type: ignore[call-arg]
-                config=config,
-                server_state=self.server_state,
-                app_state=self.lifespan.state,
-                _loop=_loop,
-            )
-
-        loop = asyncio.get_running_loop()
-
-        listeners: Sequence[socket.SocketType]
-        if sockets is not None:  # pragma: full coverage
-            # Explicitly passed a list of open sockets.
-            # We use this when the server is run from a Gunicorn worker.
-
-            def _share_socket(
-                sock: socket.SocketType,
-            ) -> socket.SocketType:  # pragma py-not-win32
-                # Windows requires the socket be explicitly shared across
-                # multiple workers (processes).
-                from socket import fromshare  # type: ignore[attr-defined]
-
-                sock_data = sock.share(os.getpid())  # type: ignore[attr-defined]
-                return fromshare(sock_data)
-
-            self.servers: list[asyncio.base_events.Server] = []
+        listener_sockets: Sequence[socket.SocketType]
+        if sockets is not None:
             for sock in sockets:
-                is_windows = platform.system() == "Windows"
-                if config.workers > 1 and is_windows:  # pragma: py-not-win32
-                    sock = _share_socket(sock)  # type: ignore[assignment]
-                server = await loop.create_server(create_protocol, sock=sock, ssl=config.ssl, backlog=config.backlog)
-                self.servers.append(server)
-            listeners = sockets
+                sock.setblocking(False)
+                self.listeners.append(SocketListener(from_stdlib_socket(sock)))
+            listener_sockets = sockets
 
-        elif config.fd is not None:  # pragma: py-win32
-            # Use an existing socket, from a file descriptor.
-            sock = socket.fromfd(config.fd, socket.AF_UNIX, socket.SOCK_STREAM)
-            server = await loop.create_server(create_protocol, sock=sock, ssl=config.ssl, backlog=config.backlog)
-            assert server.sockets is not None  # mypy
-            listeners = server.sockets
-            self.servers = [server]
-
-        elif config.uds is not None:  # pragma: py-win32
-            # Create a socket using UNIX domain socket.
+        elif config.uds is not None:
             uds_perms = 0o666
             if os.path.exists(config.uds):
                 uds_perms = os.stat(config.uds).st_mode  # pragma: full coverage
-            server = await loop.create_unix_server(
-                create_protocol, path=config.uds, ssl=config.ssl, backlog=config.backlog
-            )
-            os.chmod(config.uds, uds_perms)
-            assert server.sockets is not None  # mypy
-            listeners = server.sockets
-            self.servers = [server]
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                sock.setblocking(False)
+                sock.bind(config.uds)
+                sock.listen(config.backlog)
+                os.chmod(config.uds, uds_perms)
+            except BaseException:
+                sock.close()
+                raise
+            self.listeners.append(SocketListener(from_stdlib_socket(sock)))
+            listener_sockets = [sock]
 
         else:
-            # Standard case. Create a socket from a host/port pair.
             try:
-                server = await loop.create_server(
-                    create_protocol,
+                self.listeners = await tonio.colored.net.open_tcp_listeners(
+                    config.port,
                     host=config.host,
-                    port=config.port,
-                    ssl=config.ssl,
                     backlog=config.backlog,
                 )
             except OSError as exc:
                 logger.error(exc)
                 await self.lifespan.shutdown()
                 sys.exit(1)
-
-            assert server.sockets is not None
-            listeners = server.sockets
-            self.servers = [server]
+            listener_sockets = [listener.socket._sock for listener in self.listeners]
 
         if sockets is None:
-            self._log_started_message(listeners)
-        else:
-            # We're most likely running multiple workers, so a message has already been
-            # logged by `config.bind_socket()`.
-            pass  # pragma: full coverage
+            self._log_started_message(listener_sockets)
+
+        # Pre-populate default headers so the first request doesn't race the
+        # main loop's first on_tick.
+        date_header: list[tuple[bytes, bytes]] = []
+        if self.config.date_header:
+            date_header = [(b"date", formatdate(time.time(), usegmt=True).encode())]
+        self.server_state.default_headers = date_header + list(self.config.encoded_headers)
 
         self.started = True
 
     def _log_started_message(self, listeners: Sequence[socket.SocketType]) -> None:
         config = self.config
 
-        if config.fd is not None:  # pragma: py-win32
-            sock = listeners[0]
-            logger.info(
-                "Uvicorn running on socket %s (Press CTRL+C to quit)",
-                sock.getsockname(),
-            )
-
-        elif config.uds is not None:  # pragma: py-win32
+        if config.uds is not None:
             logger.info("Uvicorn running on unix socket %s (Press CTRL+C to quit)", config.uds)
 
         else:
             addr_format = "%s://%s:%d"
             host = "0.0.0.0" if config.host is None else config.host
             if ":" in host:
-                # It's an IPv6 address.
                 addr_format = "%s://[%s]:%d"
 
             port = config.port
             if port == 0:
                 port = listeners[0].getsockname()[1]
 
-            protocol_name = "https" if config.ssl else "http"
+            protocol_name = "https" if self._ssl_context is not None else "http"
             message = f"Uvicorn running on {addr_format} (Press CTRL+C to quit)"
             color_message = "Uvicorn running on " + click.style(addr_format, bold=True) + " (Press CTRL+C to quit)"
             logger.info(
@@ -229,17 +244,64 @@ class Server:
                 extra={"color_message": color_message},
             )
 
+    async def _run_accept_loops(self) -> None:
+        async with tonio.colored.scope() as sc:
+            for listener in self.listeners:
+                sc.spawn(self._accept_loop(listener))
+            await self._exit_ev.wait()
+            sc.cancel()
+
+    async def _accept_loop(self, listener: SocketListener) -> None:
+        # while True:
+        while not self.should_exit:
+            try:
+                stream = await listener.accept()
+            except OSError:
+                return
+            tonio.colored.spawn.without_tracking(self._handle_connection(stream))
+
+    async def _handle_connection(self, stream: SocketStream) -> None:
+        handler = self.config.http_protocol_class
+
+        handler_id = id(stream)
+        raw_sock = stream.socket._sock
+        self.server_state.connections[handler_id] = raw_sock
+        self._all_handlers_done.clear()
+
+        wrapped: SocketStream | TLSStream = stream
+        try:
+            if self._ssl_context is not None:
+                wrapped = TLSStream(stream, self._ssl_context, server_side=True, https_compatible=True)
+                try:
+                    await wrapped.handshake()
+                except Exception:
+                    logger.exception("TLS handshake failed")
+                    return
+            await handler(wrapped, self.config, self.server_state, self.lifespan.state)
+        except Exception:
+            logger.exception("Error while handling connection")
+        finally:
+            with contextlib.suppress(Exception):
+                if isinstance(wrapped, TLSStream):
+                    await wrapped.close()
+                else:
+                    wrapped.close()
+            self.server_state.connections.pop(handler_id, None)
+            if not self.server_state.connections:
+                self._all_handlers_done.set()
+
     async def main_loop(self) -> None:
         counter = 0
-        should_exit = await self.on_tick(counter)
-        while not should_exit:
-            counter += 1
-            counter = counter % 864000
-            await asyncio.sleep(0.1)
-            should_exit = await self.on_tick(counter)
+        # if await self.on_tick(counter):
+        #    return
+        ticker = tonio.colored.time.interval(0.1)
+        while True:
+            await ticker.tick()
+            counter = (counter + 1) % 864000
+            if await self.on_tick(counter):
+                return
 
     async def on_tick(self, counter: int) -> bool:
-        # Update the default headers, once per second.
         if counter % 10 == 0:
             current_time = time.time()
             current_date = formatdate(current_time, usegmt=True).encode()
@@ -251,13 +313,11 @@ class Server:
 
             self.server_state.default_headers = date_header + self.config.encoded_headers
 
-            # Callback to `callback_notify` once every `timeout_notify` seconds.
             if self.config.callback_notify is not None:
                 if current_time - self.last_notified > self.config.timeout_notify:  # pragma: full coverage
                     self.last_notified = current_time
                     await self.config.callback_notify()
 
-        # Determine if we should exit.
         if self.should_exit:
             return True
 
@@ -268,79 +328,53 @@ class Server:
 
         return False
 
-    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+    async def shutdown(self) -> None:
         logger.info("Shutting down")
-
-        # Stop accepting new connections.
-        for server in self.servers:
-            server.close()
-        for sock in sockets or []:
-            sock.close()  # pragma: full coverage
-
-        # Request shutdown on all existing connections.
-        for connection in list(self.server_state.connections):
-            connection.shutdown()
-        await asyncio.sleep(0.1)
-
-        # When 3.10 is not supported anymore, use `async with asyncio.timeout(...):`.
-        try:
-            await asyncio.wait_for(
-                self._wait_tasks_to_complete(),
-                timeout=self.config.timeout_graceful_shutdown,
-            )
-        except asyncio.TimeoutError:
-            logger.error(
-                "Cancel %s running task(s), timeout graceful shutdown exceeded",
-                len(self.server_state.tasks),
-            )
-            for t in self.server_state.tasks:
-                t.cancel(msg="Task cancelled, timeout graceful shutdown exceeded")
-
-        # Send the lifespan shutdown event, and wait for application shutdown.
+        if not self.force_exit:
+            await self._drain_connections()
         if not self.force_exit:
             await self.lifespan.shutdown()
 
-    async def _wait_tasks_to_complete(self) -> None:
-        # Wait for existing connections to finish sending responses.
-        if self.server_state.connections and not self.force_exit:
-            msg = "Waiting for connections to close. (CTRL+C to force quit)"
-            logger.info(msg)
-            while self.server_state.connections and not self.force_exit:
-                await asyncio.sleep(0.1)
-
-        # Wait for existing tasks to complete.
-        if self.server_state.tasks and not self.force_exit:
-            msg = "Waiting for background tasks to complete. (CTRL+C to force quit)"
-            logger.info(msg)
-            while self.server_state.tasks and not self.force_exit:
-                await asyncio.sleep(0.1)
-
-        for server in self.servers:
-            await server.wait_closed()
-
-    @contextlib.contextmanager
-    def capture_signals(self) -> Generator[None, None, None]:
-        # Signals can only be listened to from the main thread.
-        if threading.current_thread() is not threading.main_thread():
-            yield
+    async def _drain_connections(self) -> None:
+        if not self.server_state.connections:
             return
-        # always use signal.signal, even if loop.add_signal_handler is available
-        # this allows to restore previous signal handlers later on
-        original_handlers = {sig: signal.signal(sig, self.handle_exit) for sig in HANDLED_SIGNALS}
-        try:
-            yield
-        finally:
-            for sig, handler in original_handlers.items():
-                signal.signal(sig, handler)
-        # If we did gracefully shut down due to a signal, try to
-        # trigger the expected behaviour now; multiple signals would be
-        # done LIFO, see https://stackoverflow.com/questions/48434964
-        for captured_signal in reversed(self._captured_signals):
-            signal.raise_signal(captured_signal)
 
-    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
-        self._captured_signals.append(sig)
-        if self.should_exit and sig == signal.SIGINT:
-            self.force_exit = True  # pragma: full coverage
-        else:
-            self.should_exit = True
+        timeout = self.config.timeout_graceful_shutdown
+        in_flight = len(self.server_state.connections)
+
+        if timeout is None:
+            logger.info("Waiting for %d connection(s) to close.", in_flight)
+            await self._all_handlers_done.wait()
+            return
+
+        logger.info(
+            "Waiting up to %ss for %d connection(s) to close.",
+            timeout,
+            in_flight,
+        )
+        _, ok = await tonio.colored.time.timeout(self._all_handlers_done.wait(), timeout)
+        if ok:
+            return
+
+        remaining = len(self.server_state.connections)
+        if remaining == 0:
+            return
+        logger.warning(
+            "Graceful shutdown timeout exceeded; force-closing %d connection(s).",
+            remaining,
+        )
+        # Closing the underlying stdlib socket makes any blocked
+        # stream.receive_some / send_all return immediately (EOF or OSError),
+        # so the handler's existing error path unwinds the connection.
+        for raw_sock in list(self.server_state.connections.values()):
+            with contextlib.suppress(Exception):
+                raw_sock.close()
+        # Give handlers a moment to observe the closed socket and run their
+        # finally blocks. Anything still pending after this is abandoned when
+        # tonio.run returns.
+        await tonio.colored.time.timeout(self._all_handlers_done.wait(), 1.0)
+
+
+async def _idle_forever() -> None:
+    while True:
+        await tonio.colored.time.sleep(3600)

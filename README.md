@@ -1,152 +1,112 @@
-<p align="center">
-  <img width="320" height="320" src="https://raw.githubusercontent.com/tomchristie/uvicorn/main/docs/uvicorn.png" alt='uvicorn'>
-</p>
+# toncorn
 
-<p align="center">
-<em>An ASGI web server, for Python.</em>
-</p>
+*An ASGI web server for free-threaded Python, powered by [tonio][tonio].*
 
----
+`toncorn` is a fork of [uvicorn][uvicorn] that swaps the asyncio runtime for [tonio][tonio].
 
-[![Build Status](https://github.com/Kludex/uvicorn/workflows/Test%20Suite/badge.svg)](https://github.com/Kludex/uvicorn/actions)
-[![Package version](https://badge.fury.io/py/uvicorn.svg)](https://pypi.python.org/pypi/uvicorn)
-[![Supported Python Version](https://img.shields.io/pypi/pyversions/uvicorn.svg?color=%2334D058)](https://pypi.org/project/uvicorn)
-[![Discord](https://img.shields.io/discord/1051468649518616576?logo=discord&logoColor=ffffff&color=7389D8&labelColor=6A7EC2)](https://discord.gg/RxKUF5JuHs)
+## Install
 
----
+```shell
+$ pip install toncorn
+```
 
-**Documentation**: [https://uvicorn.dev](https://uvicorn.dev)
+`toncorn` requires free-threaded CPython 3.14 or newer (`python3.14t`) and runs `PYTHON_GIL=0`.
+Linux and macOS only; Windows is not supported and won't be (tonio doesn't target it).
 
-**Source Code**: [https://www.github.com/Kludex/uvicorn](https://www.github.com/Kludex/uvicorn)
+For the optional protocol/parser extras (matching upstream uvicorn's `[standard]` set):
 
----
-
-Uvicorn is an ASGI web server implementation for Python.
-
-Until recently Python has lacked a minimal low-level server/application interface for
-async frameworks. The [ASGI specification][asgi] fills this gap, and means we're now able to
-start building a common set of tooling usable across all async frameworks.
-
-Uvicorn supports HTTP/1.1 and WebSockets.
+```shell
+$ pip install 'toncorn[standard]'
+```
 
 ## Quickstart
 
-Install using `pip`:
-
-```shell
-$ pip install uvicorn
-```
-
-This will install uvicorn with minimal (pure Python) dependencies.
-
-```shell
-$ pip install 'uvicorn[standard]'
-```
-
-This will install uvicorn with "Cython-based" dependencies (where possible) and other "optional extras".
-
-In this context, "Cython-based" means the following:
-
-- the event loop `uvloop` will be installed and used if possible.
-- the http protocol will be handled by `httptools` if possible.
-
-Moreover, "optional extras" means that:
-
-- the websocket protocol will be handled by `websockets` (should you want to use `wsproto` you'd need to install it manually) if possible.
-- the `--reload` flag in development mode will use `watchfiles`.
-- windows users will have `colorama` installed for the colored logs.
-- `python-dotenv` will be installed should you want to use the `--env-file` option.
-- `PyYAML` will be installed to allow you to provide a `.yaml` file to `--log-config`, if desired.
-
-Create an application, in `example.py`:
+`example.py`:
 
 ```python
 async def app(scope, receive, send):
-    assert scope['type'] == 'http'
-
+    assert scope["type"] == "http"
     await send({
-        'type': 'http.response.start',
-        'status': 200,
-        'headers': [
-            (b'content-type', b'text/plain'),
-        ],
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"text/plain")],
     })
     await send({
-        'type': 'http.response.body',
-        'body': b'Hello, world!',
+        "type": "http.response.body",
+        "body": b"Hello, world!",
     })
 ```
 
-Run the server:
+Run it:
 
 ```shell
-$ uvicorn example:app
+$ PYTHON_GIL=0 toncorn example:app
 ```
 
----
-
-## Why ASGI?
-
-Most well established Python Web frameworks started out as WSGI-based frameworks.
-
-WSGI applications are a single, synchronous callable that takes a request and returns a response.
-This doesn’t allow for long-lived connections, like you get with long-poll HTTP or WebSocket connections,
-which WSGI doesn't support well.
-
-Having an async concurrency model also allows for options such as lightweight background tasks,
-and can be less of a limiting factor for endpoints that have long periods being blocked on network
-I/O such as dealing with slow HTTP requests.
-
----
-
-## Alternative ASGI servers
-
-A strength of the ASGI protocol is that it decouples the server implementation
-from the application framework. This allows for an ecosystem of interoperating
-webservers and application frameworks.
-
-### Daphne
-
-The first ASGI server implementation, originally developed to power Django Channels, is [the Daphne webserver][daphne].
-
-It is run widely in production, and supports HTTP/1.1, HTTP/2, and WebSockets.
-
-Any of the example applications given here can equally well be run using `daphne` instead.
+You'll see a banner identifying the toncorn version and the uvicorn version it
+tracks:
 
 ```
-$ pip install daphne
-$ daphne app:App
+INFO:     toncorn 0.48.0.0 (uvicorn 0.48.0)
+INFO:     Started server process [12345]
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
-### Hypercorn
+The package ships both `import toncorn` and `import uvicorn` — the source tree
+lives under the original `uvicorn` package name to keep the diff against
+upstream small, and `toncorn` is a thin re-export. Pick whichever import you
+prefer; they expose the same `Config`, `Server`, `run`, `main`.
 
-[Hypercorn][hypercorn] was initially part of the Quart web framework, before
-being separated out into a standalone ASGI server.
+> **Note**: this means `toncorn` and the real PyPI `uvicorn` collide on the `uvicorn` import name; don't install both in the same environment.
 
-Hypercorn supports HTTP/1.1, HTTP/2, and WebSockets.
+## Programmatic use
 
-It also supports [the excellent `trio` async framework][trio], as an alternative to `asyncio`.
-
+```python
+import toncorn
+toncorn.run("example:app", host="127.0.0.1", port=8000)
 ```
-$ pip install hypercorn
-$ hypercorn app:App
+
+Or with an explicit Config + Server:
+
+```python
+import toncorn
+
+config = toncorn.Config(app=app, host="127.0.0.1", port=8000)
+server = toncorn.Server(config)
+server.run()
 ```
 
-### Mangum
+## Differences from uvicorn
 
-[Mangum][mangum] is an adapter for using ASGI applications with AWS Lambda & API Gateway.
+- **Runtime is tonio, not asyncio**. There's no `--loop` flag, no
+  `uvloop`/`asyncio` switch. Everything runs on a single tonio runtime with a
+  configurable thread pool.
+- **Concurrency model is threads, not processes**. The old `--workers N` flag
+  is replaced by `--threads N`, which sizes the tonio scheduler's thread pool.
+  No `multiprocessing` supervisor, no preforked workers, no graceful-restart
+  process orchestration.
+- **No `--reload`**. The auto-reload supervisor is gone. Use your editor's
+  hot-reload or a separate process manager during development.
+- **No Windows support**. POSIX only.
+- **No in-tree WSGI middleware**. The deprecated WSGI bridge has been removed;
+  use `a2wsgi` or `asgiref.wsgi` if you need WSGI compatibility.
+- **Python 3.14+ only**. Earlier Python versions are not supported.
 
-### Granian
+The version number reflects both upstream and fork: `{uvicorn}.{toncorn}`, so
+`0.48.0.0` tracks uvicorn `0.48.0` with toncorn patch `0`. Patch-level
+releases against the same uvicorn baseline bump the last segment
+(`0.48.0.0` → `0.48.0.1`).
 
-[Granian][granian] is an ASGI compatible Rust HTTP server which supports HTTP/2, TLS and WebSockets.
+## Upstream tracking
 
----
+The source tree under `uvicorn/` is kept as close to upstream uvicorn as
+possible to make merges/rebases tractable. Fork-specific changes are
+intentionally minimal and called out where they appear. The `toncorn/` package
+is a re-export shim plus the toncorn-specific version.
 
-<p align="center"><i>Uvicorn is <a href="https://github.com/Kludex/uvicorn/blob/main/LICENSE.md">BSD licensed</a> code.<br/>Designed & crafted with care.</i><br/>&mdash; 🦄  &mdash;</p>
+## License
 
-[asgi]: https://asgi.readthedocs.io/en/latest/
-[daphne]: https://github.com/django/daphne
-[hypercorn]: https://github.com/pgjones/hypercorn
-[trio]: https://trio.readthedocs.io
-[mangum]: https://github.com/jordaneremieff/mangum
-[granian]: https://github.com/emmett-framework/granian
+BSD-3-Clause, same as upstream uvicorn. See `LICENSE.md`.
+
+[uvicorn]: https://github.com/Kludex/uvicorn
+[tonio]: https://github.com/gi0baro/tonio

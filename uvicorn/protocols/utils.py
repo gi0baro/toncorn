@@ -1,51 +1,51 @@
 from __future__ import annotations
 
-import asyncio
-import socket
 import urllib.parse
 
+from tonio.colored.net import SocketStream
+from tonio.colored.net.tls import TLSStream
+
 from uvicorn._types import WWWScope
+
+type Stream = SocketStream | TLSStream
 
 
 class ClientDisconnected(OSError): ...
 
 
-def get_remote_addr(transport: asyncio.Transport) -> tuple[str, int] | None:
-    socket_info: socket.socket | None = transport.get_extra_info("socket")
-    if socket_info is not None:
-        try:
-            info = socket_info.getpeername()
-            return (str(info[0]), int(info[1])) if isinstance(info, tuple) else None
-        except OSError:  # pragma: no cover
-            # This case appears to inconsistently occur with uvloop
-            # bound to a unix domain socket.
-            return None
+def _underlying(stream: Stream) -> SocketStream:
+    """Return the SocketStream underneath an optional TLS wrapper."""
+    if isinstance(stream, TLSStream):
+        return stream.transport  # type: ignore[return-value]
+    return stream
 
-    info = transport.get_extra_info("peername")
-    if info is not None and isinstance(info, list | tuple) and len(info) == 2:
+
+def get_remote_addr(stream: Stream) -> tuple[str, int] | None:
+    sock = _underlying(stream).socket
+    try:
+        info = sock.getpeername()
+    except OSError:  # pragma: no cover
+        return None
+    if isinstance(info, tuple) and len(info) >= 2:
         return (str(info[0]), int(info[1]))
     return None
 
 
-def get_local_addr(transport: asyncio.Transport) -> tuple[str, int | None] | None:
-    socket_info: socket.socket | None = transport.get_extra_info("socket")
-    if socket_info is not None:
-        info = socket_info.getsockname()
-        if isinstance(info, tuple):
-            return (str(info[0]), int(info[1]))
-        if isinstance(info, str):
-            return (info, None)
+def get_local_addr(stream: Stream) -> tuple[str, int | None] | None:
+    sock = _underlying(stream).socket
+    try:
+        info = sock.getsockname()
+    except OSError:  # pragma: no cover
         return None
-    info = transport.get_extra_info("sockname")
-    if info is not None and isinstance(info, list | tuple) and len(info) == 2:
+    if isinstance(info, tuple) and len(info) >= 2:
         return (str(info[0]), int(info[1]))
     if isinstance(info, str):
         return (info, None)
     return None
 
 
-def is_ssl(transport: asyncio.Transport) -> bool:
-    return bool(transport.get_extra_info("sslcontext"))
+def is_ssl(stream: Stream) -> bool:
+    return isinstance(stream, TLSStream)
 
 
 def get_client_addr(scope: WWWScope) -> str:

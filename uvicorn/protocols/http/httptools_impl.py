@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import asyncio
-import contextvars
+import collections
+import contextlib
 import http
 import logging
 import re
-import sys
-import urllib
-from asyncio.events import TimerHandle
-from collections import deque
-from collections.abc import Callable
+import urllib.parse
 from typing import Any, Literal
 
 import httptools
+import tonio
+import tonio.colored
+import tonio.colored.time
 
 from uvicorn._types import (
     ASGI3Application,
@@ -22,9 +21,15 @@ from uvicorn._types import (
     HTTPScope,
 )
 from uvicorn.config import Config
-from uvicorn.logging import TRACE_LOG_LEVEL
-from uvicorn.protocols.http.flow_control import CLOSE_HEADER, HIGH_WATER_LIMIT, FlowControl, service_unavailable
-from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
+from uvicorn.protocols.http.flow_control import CLOSE_HEADER, service_unavailable
+from uvicorn.protocols.utils import (
+    Stream,
+    get_client_addr,
+    get_local_addr,
+    get_path_with_query_string,
+    get_remote_addr,
+    is_ssl,
+)
 from uvicorn.server import ServerState
 
 HEADER_RE = re.compile(b'[\x00-\x1f\x7f()<>@,;:\\[\\]={} \t\\\\"]')
@@ -41,200 +46,185 @@ def _get_status_line(status_code: int) -> bytes:
 
 STATUS_LINE = {status_code: _get_status_line(status_code) for status_code in range(100, 600)}
 
+logger = logging.getLogger("uvicorn.error")
+access_logger = logging.getLogger("uvicorn.access")
 
-class HttpToolsProtocol(asyncio.Protocol):
+
+async def handle(
+    stream: Stream,
+    config: Config,
+    server_state: ServerState,
+    app_state: dict[str, Any],
+) -> None:
+    cb = _Callbacks(config, server_state, app_state, stream)
+    parser = httptools.HttpRequestParser(cb)
+    try:
+        parser.set_dangerous_leniencies(lenient_data_after_close=True)
+    except AttributeError:  # pragma: no cover - httptools < 0.6.3
+        pass
+    cb.parser = parser
+
+    access_log = access_logger.hasHandlers()
+
+    while True:
+        # Read bytes from the stream until at least one cycle is dispatched.
+        # Pipelined requests parsed during a previous cycle's body read may
+        # have already populated dispatch_queue — in that case we skip the
+        # read entirely.
+        while not cb.dispatch_queue:
+            data, ok = await tonio.colored.time.timeout(stream.receive_some(), config.timeout_keep_alive)
+            if not ok:
+                return
+            if not data:
+                return
+            try:
+                parser.feed_data(data)
+            except httptools.HttpParserError:
+                logger.warning("Invalid HTTP request received.")
+                await _send_simple(stream, 400, b"Invalid HTTP request received.", server_state)
+                return
+            except httptools.HttpParserUpgrade:
+                await _handle_upgrade(stream, parser, cb, config, server_state, app_state)
+                return
+
+        cycle = cb.dispatch_queue.popleft()
+        cycle.stream = stream
+        cycle.parser = parser
+        cycle.access_log = access_log
+        cycle.default_headers = server_state.default_headers
+
+        try:
+            await cycle.run_asgi()
+            await cycle.drain_pending_body()
+        except httptools.HttpParserUpgrade:
+            # Triggered if feed_data inside cycle.receive / drain encounters an
+            # upgrade — extremely unlikely (pipelined upgrade after a normal
+            # request) but handled for completeness.
+            await _handle_upgrade(stream, parser, cb, config, server_state, app_state)
+            return
+        except httptools.HttpParserError:
+            return
+
+        server_state.total_requests += 1
+        if cycle.disconnected or not cycle.keep_alive:
+            return
+
+
+async def _handle_upgrade(
+    stream: Stream,
+    parser: httptools.HttpRequestParser,
+    cb: _Callbacks,
+    config: Config,
+    server_state: ServerState,
+    app_state: dict[str, Any],
+) -> None:
+    if not _is_websocket_upgrade(cb.headers):
+        await _send_simple(stream, 400, b"Invalid HTTP request received.", server_state)
+        return
+    ws_handler = config.ws_protocol_class
+    if ws_handler is None:
+        logger.warning(
+            "No supported WebSocket library detected. "
+            "Please use \"pip install 'uvicorn[standard]'\", or install 'websockets' or 'wsproto' manually."
+        )
+        await _send_simple(stream, 426, b"Upgrade Required", server_state)
+        return
+    request_bytes = _rebuild_request_bytes(parser, cb)
+    await ws_handler(stream, config, server_state, app_state, request_bytes=request_bytes)
+
+
+async def _send_simple(stream: Stream, status: int, body: bytes, server_state: ServerState) -> None:
+    content = [STATUS_LINE[status]]
+    for name, value in server_state.default_headers:
+        content.extend([name, b": ", value, b"\r\n"])
+    content.extend(
+        [
+            b"content-type: text/plain; charset=utf-8\r\n",
+            b"content-length: " + str(len(body)).encode("ascii") + b"\r\n",
+            b"connection: close\r\n",
+            b"\r\n",
+            body,
+        ]
+    )
+    with contextlib.suppress(OSError):
+        await stream.send_all(b"".join(content))
+
+
+def _rebuild_request_bytes(parser: httptools.HttpRequestParser, cb: _Callbacks) -> bytes:
+    method = parser.get_method()
+    http_version = parser.get_http_version()
+    parts: list[bytes] = [method, b" ", cb.url, b" HTTP/", http_version.encode("ascii"), b"\r\n"]
+    for name, value in cb.headers:
+        parts.extend([name, b": ", value, b"\r\n"])
+    parts.append(b"\r\n")
+    return b"".join(parts)
+
+
+def _is_websocket_upgrade(headers: list[tuple[bytes, bytes]]) -> bool:
+    connection_tokens: list[bytes] = []
+    upgrade: bytes | None = None
+    for name, value in headers:
+        if name == b"connection":
+            connection_tokens = [t.lower().strip() for t in value.split(b",")]
+        elif name == b"upgrade":
+            upgrade = value.lower()
+    return b"upgrade" in connection_tokens and upgrade == b"websocket"
+
+
+class _Callbacks:
+    """httptools parser callbacks that mutate cycle state synchronously.
+
+    Single-task design: callbacks fire inside `parser.feed_data(...)` which is
+    called from the same coroutine that processes cycles. No channel, no
+    inter-task synchronization — cycle.body and cycle.more_body are updated
+    in-place and visible to `cycle.receive` immediately after feed_data returns.
+    """
+
     def __init__(
         self,
         config: Config,
         server_state: ServerState,
         app_state: dict[str, Any],
-        _loop: asyncio.AbstractEventLoop | None = None,
+        stream: Stream,
     ) -> None:
-        if not config.loaded:
-            config.load()
-
         self.config = config
-        self.app = config.loaded_app
-        self.loop = _loop or asyncio.get_event_loop()
-        self.logger = logging.getLogger("uvicorn.error")
-        self.access_logger = logging.getLogger("uvicorn.access")
-        self.access_log = self.access_logger.hasHandlers()
-        self.parser = httptools.HttpRequestParser(self)
-
-        try:
-            # Enable dangerous leniencies to allow server to a response on the first request from a pipelined request.
-            self.parser.set_dangerous_leniencies(lenient_data_after_close=True)
-        except AttributeError:  # pragma: no cover
-            # httptools < 0.6.3
-            pass
-
-        self.ws_protocol_class = config.ws_protocol_class
-        self.root_path = config.root_path
-        self.limit_concurrency = config.limit_concurrency
-        self.app_state = app_state
-
-        # Timeouts
-        self.timeout_keep_alive_task: TimerHandle | None = None
-        self.timeout_keep_alive = config.timeout_keep_alive
-
-        # Global state
         self.server_state = server_state
-        self.connections = server_state.connections
-        self.tasks = server_state.tasks
+        self.app_state = app_state
+        self.parser: httptools.HttpRequestParser | None = None
 
-        # Per-connection state
-        self.transport: asyncio.Transport = None  # type: ignore[assignment]
-        self.flow: FlowControl = None  # type: ignore[assignment]
-        self.server: tuple[str, int | None] | None = None
-        self.client: tuple[str, int] | None = None
-        self.scheme: Literal["http", "https"] | None = None
-        self.pipeline: deque[tuple[RequestResponseCycle, ASGI3Application]] = deque()
+        self.server_addr = get_local_addr(stream)
+        self.client_addr = get_remote_addr(stream)
+        self.scheme: Literal["http", "https"] = "https" if is_ssl(stream) else "http"
 
-        # Per-request state
-        self.scope: HTTPScope = None  # type: ignore[assignment]
-        self.headers: list[tuple[bytes, bytes]] = None  # type: ignore[assignment]
+        # Per-request scratch state populated before on_headers_complete.
+        self.url = b""
+        self.headers: list[tuple[bytes, bytes]] = []
         self.expect_100_continue = False
-        self.cycle: RequestResponseCycle = None  # type: ignore[assignment]
+        self.scope: HTTPScope | None = None
 
-    # Protocol interface
-    def connection_made(  # type: ignore[override]
-        self, transport: asyncio.Transport
-    ) -> None:
-        self.connections.add(self)
-
-        self.transport = transport
-        self.flow = FlowControl(transport)
-        self.server = get_local_addr(transport)
-        self.client = get_remote_addr(transport)
-        self.scheme = "https" if is_ssl(transport) else "http"
-
-        if self.logger.level <= TRACE_LOG_LEVEL:
-            prefix = "%s:%d - " % self.client if self.client else ""
-            self.logger.log(TRACE_LOG_LEVEL, "%sHTTP connection made", prefix)
-
-    def connection_lost(self, exc: Exception | None) -> None:
-        self.connections.discard(self)
-
-        if self.logger.level <= TRACE_LOG_LEVEL:
-            prefix = "%s:%d - " % self.client if self.client else ""
-            self.logger.log(TRACE_LOG_LEVEL, "%sHTTP connection lost", prefix)
-
-        if self.cycle and not self.cycle.response_complete:
-            self.cycle.disconnected = True
-        if self.cycle is not None:
-            self.cycle.message_event.set()
-        if self.flow is not None:
-            self.flow.resume_writing()
-        if exc is None:
-            self.transport.close()
-            self._unset_keepalive_if_required()
-
-        self.parser = None
-
-    def eof_received(self) -> None:
-        pass
-
-    def _unset_keepalive_if_required(self) -> None:
-        if self.timeout_keep_alive_task is not None:
-            self.timeout_keep_alive_task.cancel()
-            self.timeout_keep_alive_task = None
-
-    def _get_upgrade(self) -> bytes | None:
-        connection = []
-        upgrade = None
-        for name, value in self.headers:
-            if name == b"connection":
-                connection = [token.lower().strip() for token in value.split(b",")]
-            if name == b"upgrade":
-                upgrade = value.lower()
-        if b"upgrade" in connection:
-            return upgrade
-        return None  # pragma: full coverage
-
-    def _should_upgrade_to_ws(self) -> bool:
-        if self.ws_protocol_class is None:
-            return False
-        return True
-
-    def _unsupported_upgrade_warning(self) -> None:
-        self.logger.warning("Unsupported upgrade request.")
-        if not self._should_upgrade_to_ws():
-            msg = "No supported WebSocket library detected. Please use \"pip install 'uvicorn[standard]'\", or install 'websockets' or 'wsproto' manually."  # noqa: E501
-            self.logger.warning(msg)
-
-    def _should_upgrade(self) -> bool:
-        upgrade = self._get_upgrade()
-        return upgrade == b"websocket" and self._should_upgrade_to_ws()
-
-    def data_received(self, data: bytes) -> None:
-        self._unset_keepalive_if_required()
-
-        try:
-            self.parser.feed_data(data)
-        except httptools.HttpParserError:
-            msg = "Invalid HTTP request received."
-            self.logger.warning(msg)
-            self.send_400_response(msg)
-            return
-        except httptools.HttpParserUpgrade:
-            if self._should_upgrade():
-                self.handle_websocket_upgrade()
-            else:
-                self._unsupported_upgrade_warning()
-
-    def handle_websocket_upgrade(self) -> None:
-        if self.logger.level <= TRACE_LOG_LEVEL:
-            prefix = "%s:%d - " % self.client if self.client else ""
-            self.logger.log(TRACE_LOG_LEVEL, "%sUpgrading to WebSocket", prefix)
-
-        self.connections.discard(self)
-        method = self.scope["method"].encode()
-        output = [method, b" ", self.url, b" HTTP/1.1\r\n"]
-        for name, value in self.scope["headers"]:
-            output += [name, b": ", value, b"\r\n"]
-        output.append(b"\r\n")
-        protocol = self.ws_protocol_class(  # type: ignore[call-arg, misc]
-            config=self.config,
-            server_state=self.server_state,
-            app_state=self.app_state,
-        )
-        protocol.connection_made(self.transport)
-        protocol.data_received(b"".join(output))
-        self.transport.set_protocol(protocol)
-
-    def send_400_response(self, msg: str) -> None:
-        content = [STATUS_LINE[400]]
-        for name, value in self.server_state.default_headers:
-            content.extend([name, b": ", value, b"\r\n"])  # pragma: full coverage
-        content.extend(
-            [
-                b"content-type: text/plain; charset=utf-8\r\n",
-                b"content-length: " + str(len(msg)).encode("ascii") + b"\r\n",
-                b"connection: close\r\n",
-                b"\r\n",
-                msg.encode("ascii"),
-            ]
-        )
-        self.transport.write(b"".join(content))
-        self.transport.close()
+        # Cycle currently being filled by body/end callbacks. Set in
+        # on_headers_complete; persists until the next on_headers_complete
+        # replaces it.
+        self.parsing: _Cycle | None = None
+        # Cycles built and not yet handed to the outer handle loop.
+        self.dispatch_queue: collections.deque[_Cycle] = collections.deque()
 
     def on_message_begin(self) -> None:
         self.url = b""
-        self.expect_100_continue = False
         self.headers = []
+        self.expect_100_continue = False
         self.scope = {  # type: ignore[typeddict-item]
             "type": "http",
             "asgi": {"version": self.config.asgi_version, "spec_version": "2.3"},
             "http_version": "1.1",
-            "server": self.server,
-            "client": self.client,
-            "scheme": self.scheme,  # type: ignore[typeddict-item]
-            "root_path": self.root_path,
+            "server": self.server_addr,
+            "client": self.client_addr,
+            "scheme": self.scheme,
+            "root_path": self.config.root_path,
             "headers": self.headers,
             "state": self.app_state.copy(),
         }
 
-    # Parser callbacks
     def on_url(self, url: bytes) -> None:
         self.url += url
 
@@ -245,206 +235,140 @@ class HttpToolsProtocol(asyncio.Protocol):
         self.headers.append((name, value))
 
     def on_headers_complete(self) -> None:
+        assert self.parser is not None
+        assert self.scope is not None
+
         http_version = self.parser.get_http_version()
         method = self.parser.get_method()
         self.scope["method"] = method.decode("ascii")
         if http_version != "1.1":
             self.scope["http_version"] = http_version
-        if self.parser.should_upgrade() and self._should_upgrade():
+
+        # WS upgrades: feed_data will raise HttpParserUpgrade right after this
+        # callback. Don't build a cycle for it; the outer handle loop catches
+        # the exception and dispatches.
+        if self.parser.should_upgrade() and _is_websocket_upgrade(self.headers):
             return
+
         parsed_url = httptools.parse_url(self.url)
         raw_path = parsed_url.path
         path = raw_path.decode("ascii")
         if "%" in path:
             path = urllib.parse.unquote(path)
-        full_path = self.root_path + path
-        full_raw_path = self.root_path.encode("ascii") + raw_path
+        full_path = self.config.root_path + path
+        full_raw_path = self.config.root_path.encode("ascii") + raw_path
         self.scope["path"] = full_path
         self.scope["raw_path"] = full_raw_path
         self.scope["query_string"] = parsed_url.query or b""
 
-        # Handle 503 responses when 'limit_concurrency' is exceeded.
-        if self.limit_concurrency is not None and (
-            len(self.connections) >= self.limit_concurrency or len(self.tasks) >= self.limit_concurrency
+        if self.config.limit_concurrency is not None and (
+            len(self.server_state.connections) >= self.config.limit_concurrency
         ):
-            app = service_unavailable
-            message = "Exceeded concurrency limit."
-            self.logger.warning(message)
+            logger.warning("Exceeded concurrency limit.")
+            app: Any = service_unavailable
         else:
-            app = self.app
+            app = self.config.loaded_app
 
-        existing_cycle = self.cycle
-        self.cycle = RequestResponseCycle(
+        cycle = _Cycle(
             scope=self.scope,
-            transport=self.transport,
-            flow=self.flow,
-            logger=self.logger,
-            access_logger=self.access_logger,
-            access_log=self.access_log,
-            default_headers=self.server_state.default_headers,
-            message_event=asyncio.Event(),
+            app=app,
             expect_100_continue=self.expect_100_continue,
             keep_alive=http_version != "1.0",
-            on_response=self.on_response_complete,
         )
-        if existing_cycle is None or existing_cycle.response_complete:
-            # Standard case - start processing the request.
-            self._start_asgi_task(self.cycle, app)
-        else:
-            # Pipelined HTTP requests need to be queued up.
-            self.flow.pause_reading()
-            self.pipeline.appendleft((self.cycle, app))
-
-    def _start_asgi_task(self, cycle: RequestResponseCycle, app: ASGI3Application) -> None:
-        if self.config.reset_contextvars:
-            # Opt-in workaround for https://github.com/python/cpython/issues/140947:
-            # asyncio can leak context vars between tasks. Hides context set in the
-            # lifespan or by external instrumentation.
-            if sys.version_info >= (3, 11):  # pragma: py-lt-311
-                task = self.loop.create_task(cycle.run_asgi(app), context=contextvars.Context())
-            else:  # pragma: py-gte-311
-                task = contextvars.Context().run(self.loop.create_task, cycle.run_asgi(app))
-        else:
-            task = self.loop.create_task(cycle.run_asgi(app))
-        task.add_done_callback(self.tasks.discard)
-        self.tasks.add(task)
+        self.parsing = cycle
+        self.dispatch_queue.append(cycle)
 
     def on_body(self, body: bytes) -> None:
-        if (self.parser.should_upgrade() and self._should_upgrade()) or self.cycle.response_complete:
+        cycle = self.parsing
+        if cycle is None or cycle.response_complete:
             return
-        self.cycle.body += body
-        if len(self.cycle.body) > HIGH_WATER_LIMIT:
-            self.flow.pause_reading()
-        self.cycle.message_event.set()
+        cycle.body.extend(body)
 
     def on_message_complete(self) -> None:
-        if (self.parser.should_upgrade() and self._should_upgrade()) or self.cycle.response_complete:
+        cycle = self.parsing
+        if cycle is None or cycle.response_complete:
             return
-        self.cycle.more_body = False
-        self.cycle.message_event.set()
-
-    def on_response_complete(self) -> None:
-        # Callback for pipelined HTTP requests to be started.
-        self.server_state.total_requests += 1
-
-        if self.transport.is_closing():
-            return
-
-        self._unset_keepalive_if_required()
-
-        # Unpause data reads if needed.
-        self.flow.resume_reading()
-
-        # Unblock any pipelined events. If there are none, arm the
-        # Keep-Alive timeout instead.
-        if self.pipeline:
-            cycle, app = self.pipeline.pop()
-            self._start_asgi_task(cycle, app)
-        else:
-            self.timeout_keep_alive_task = self.loop.call_later(
-                self.timeout_keep_alive, self.timeout_keep_alive_handler
-            )
-
-    def shutdown(self) -> None:
-        """
-        Called by the server to commence a graceful shutdown.
-        """
-        if self.cycle is None or self.cycle.response_complete:
-            self.transport.close()
-        else:
-            self.cycle.keep_alive = False
-
-    def pause_writing(self) -> None:
-        """
-        Called by the transport when the write buffer exceeds the high water mark.
-        """
-        self.flow.pause_writing()  # pragma: full coverage
-
-    def resume_writing(self) -> None:
-        """
-        Called by the transport when the write buffer drops below the low water mark.
-        """
-        self.flow.resume_writing()  # pragma: full coverage
-
-    def timeout_keep_alive_handler(self) -> None:
-        """
-        Called on a keep-alive connection if no new data is received after a short
-        delay.
-        """
-        if not self.transport.is_closing():
-            self.transport.close()
+        cycle.more_body = False
 
 
-class RequestResponseCycle:
+class _Cycle:
+    """One request/response exchange.
+
+    Sole owner of the stream during run_asgi. `receive()` pulls bytes from
+    the stream and feeds the parser inline; callbacks update `body` and
+    `more_body` synchronously, so we never need to await on a separate event.
+    """
+
     def __init__(
         self,
         scope: HTTPScope,
-        transport: asyncio.Transport,
-        flow: FlowControl,
-        logger: logging.Logger,
-        access_logger: logging.Logger,
-        access_log: bool,
-        default_headers: list[tuple[bytes, bytes]],
-        message_event: asyncio.Event,
+        app: ASGI3Application,
         expect_100_continue: bool,
         keep_alive: bool,
-        on_response: Callable[..., None],
-    ):
+    ) -> None:
         self.scope = scope
-        self.transport = transport
-        self.flow = flow
-        self.logger = logger
-        self.access_logger = access_logger
-        self.access_log = access_log
-        self.default_headers = default_headers
-        self.message_event = message_event
-        self.on_response = on_response
+        self.app = app
 
-        # Connection state
+        # Wired in by handle() before run_asgi.
+        self.stream: Stream = None  # type: ignore[assignment]
+        self.parser: httptools.HttpRequestParser = None  # type: ignore[assignment]
+        self.access_log: bool = False
+        self.default_headers: list[tuple[bytes, bytes]] = []
+
         self.disconnected = False
         self.keep_alive = keep_alive
         self.waiting_for_100_continue = expect_100_continue
 
-        # Request state
         self.body = bytearray()
         self.more_body = True
-
-        # Response state
         self.response_started = False
         self.response_complete = False
         self.chunked_encoding: bool | None = None
         self.expected_content_length = 0
 
-    # ASGI exception wrapper
-    async def run_asgi(self, app: ASGI3Application) -> None:
+    async def run_asgi(self) -> None:
         try:
-            result = await app(  # type: ignore[func-returns-value]
-                self.scope, self.receive, self.send
-            )
+            result = await self.app(self.scope, self.receive, self.send)  # type: ignore[func-returns-value]
         except BaseException as exc:
-            msg = "Exception in ASGI application\n"
-            self.logger.error(msg, exc_info=exc)
+            logger.error("Exception in ASGI application\n", exc_info=exc)
             if not self.response_started:
-                await self.send_500_response()
+                await self._send_500_response()
             else:
-                self.transport.close()
+                self.keep_alive = False
         else:
             if result is not None:
-                msg = "ASGI callable should return None, but returned '%s'."
-                self.logger.error(msg, result)
-                self.transport.close()
+                logger.error("ASGI callable should return None, but returned '%s'.", result)
+                self.keep_alive = False
             elif not self.response_started and not self.disconnected:
-                msg = "ASGI callable returned without starting response."
-                self.logger.error(msg)
-                await self.send_500_response()
+                logger.error("ASGI callable returned without starting response.")
+                await self._send_500_response()
             elif not self.response_complete and not self.disconnected:
-                msg = "ASGI callable returned without completing response."
-                self.logger.error(msg)
-                self.transport.close()
-        finally:
-            self.on_response = lambda: None
+                logger.error("ASGI callable returned without completing response.")
+                self.keep_alive = False
 
-    async def send_500_response(self) -> None:
+    async def drain_pending_body(self) -> None:
+        """If the app returned without reading the full body, drive the parser
+        until on_message_complete fires so the parser is positioned at the
+        next request.
+        """
+        while self.more_body and not self.disconnected:
+            try:
+                data = await self.stream.receive_some()
+            except OSError:
+                self.disconnected = True
+                return
+            if not data:
+                self.disconnected = True
+                return
+            try:
+                self.parser.feed_data(data)
+            except httptools.HttpParserError:
+                self.disconnected = True
+                return
+            # HttpParserUpgrade is intentionally left to propagate; the outer
+            # handle loop wraps run_asgi/drain_pending_body in a try.
+
+    async def _send_500_response(self) -> None:
         await self.send(
             {
                 "type": "http.response.start",
@@ -458,19 +382,13 @@ class RequestResponseCycle:
         )
         await self.send({"type": "http.response.body", "body": b"Internal Server Error", "more_body": False})
 
-    # ASGI interface
     async def send(self, message: ASGISendEvent) -> None:
-        if self.flow.write_paused and not self.disconnected:
-            await self.flow.drain()  # pragma: full coverage
-
         if self.disconnected:
-            return  # pragma: full coverage
+            return
 
         if not self.response_started:
-            # Sending response status line and headers
             if message["type"] != "http.response.start":
                 raise RuntimeError(f"Expected ASGI message 'http.response.start', but got '{message['type']}'.")
-
             self.response_started = True
             self.waiting_for_100_continue = False
 
@@ -481,7 +399,7 @@ class RequestResponseCycle:
                 headers = headers + [CLOSE_HEADER]
 
             if self.access_log:
-                self.access_logger.info(
+                access_logger.info(
                     '%s - "%s %s HTTP/%s" %d',
                     get_client_addr(self.scope),
                     self.scope["method"],
@@ -490,12 +408,10 @@ class RequestResponseCycle:
                     status_code,
                 )
 
-            # Write response status line and headers
             content = [STATUS_LINE[status_code]]
-
             for name, value in headers:
                 if HEADER_RE.search(name):
-                    raise RuntimeError("Invalid HTTP header name.")  # pragma: full coverage
+                    raise RuntimeError("Invalid HTTP header name.")  # pragma: no cover
                 if HEADER_VALUE_RE.search(value):
                     raise RuntimeError("Invalid HTTP header value.")
 
@@ -511,66 +427,89 @@ class RequestResponseCycle:
                 content.extend([name, b": ", value, b"\r\n"])
 
             if self.chunked_encoding is None and self.scope["method"] != "HEAD" and status_code not in (204, 304):
-                # Neither content-length nor transfer-encoding specified
                 self.chunked_encoding = True
                 content.append(b"transfer-encoding: chunked\r\n")
 
             content.append(b"\r\n")
-            self.transport.write(b"".join(content))
+            try:
+                await self.stream.send_all(b"".join(content))
+            except OSError:
+                self.disconnected = True
+                return
 
         elif not self.response_complete:
-            # Sending response body
             if message["type"] != "http.response.body":
                 raise RuntimeError(f"Expected ASGI message 'http.response.body', but got '{message['type']}'.")
 
             body = message.get("body", b"")
             more_body = message.get("more_body", False)
 
-            # Write response body
             if self.scope["method"] == "HEAD":
                 self.expected_content_length = 0
+                out: bytes = b""
             elif self.chunked_encoding:
                 if body:
-                    content = [b"%x\r\n" % len(body), body, b"\r\n"]
+                    out = b"%x\r\n%s\r\n" % (len(body), body)
                 else:
-                    content = []
+                    out = b""
                 if not more_body:
-                    content.append(b"0\r\n\r\n")
-                self.transport.write(b"".join(content))
+                    out = out + b"0\r\n\r\n"
             else:
                 num_bytes = len(body)
                 if num_bytes > self.expected_content_length:
                     raise RuntimeError("Response content longer than Content-Length")
-                else:
-                    self.expected_content_length -= num_bytes
-                self.transport.write(body)
+                self.expected_content_length -= num_bytes
+                out = body
 
-            # Handle response completion
+            if out:
+                try:
+                    await self.stream.send_all(out)
+                except OSError:
+                    self.disconnected = True
+                    return
+
             if not more_body:
                 if self.expected_content_length != 0:
                     raise RuntimeError("Response content shorter than Content-Length")
                 self.response_complete = True
-                self.message_event.set()
-                if not self.keep_alive:
-                    self.transport.close()
-                self.on_response()
 
         else:
-            # Response already sent
             raise RuntimeError(f"Unexpected ASGI message '{message['type']}' sent, after response already completed.")
 
     async def receive(self) -> ASGIReceiveEvent:
-        if self.waiting_for_100_continue and not self.transport.is_closing():
-            self.transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+        if self.waiting_for_100_continue:
+            try:
+                await self.stream.send_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            except OSError:
+                self.disconnected = True
             self.waiting_for_100_continue = False
 
-        if not self.disconnected and not self.response_complete:
-            self.flow.resume_reading()
-            await self.message_event.wait()
-            self.message_event.clear()
+        # Read bytes and feed parser inline until we have body data to return
+        # or the body is fully consumed.
+        while not self.body and self.more_body and not self.disconnected:
+            try:
+                data = await self.stream.receive_some()
+            except OSError:
+                self.disconnected = True
+                break
+            if not data:
+                self.disconnected = True
+                break
+            try:
+                self.parser.feed_data(data)
+            except httptools.HttpParserError:
+                self.disconnected = True
+                break
+            # HttpParserUpgrade propagates to handle().
 
-        if self.disconnected or self.response_complete:
+        if self.disconnected and not self.body:
             return {"type": "http.disconnect"}
-        message: HTTPRequestEvent = {"type": "http.request", "body": bytes(self.body), "more_body": self.more_body}
+
+        chunk = bytes(self.body)
         self.body = bytearray()
+        message: HTTPRequestEvent = {
+            "type": "http.request",
+            "body": chunk,
+            "more_body": self.more_body,
+        }
         return message

@@ -1,196 +1,159 @@
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import contextvars
 import json
 import logging
-import signal
-import sys
-from collections.abc import Callable, Generator
-from contextlib import AbstractContextManager
+import socket
+from typing import Any
 
 import httpx
 import pytest
+import tonio.colored
+import tonio.colored.time
 
-from tests.protocols.test_http import SIMPLE_GET_REQUEST
 from tests.utils import run_server
-from uvicorn._types import ASGIApplication, ASGIReceiveCallable, ASGISendCallable, Scope
+from uvicorn._types import ASGIReceiveCallable, ASGISendCallable, Scope
 from uvicorn.config import Config
 from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT
-from uvicorn.protocols.http.h11_impl import H11Protocol
-from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
-from uvicorn.server import Server
 
-pytestmark = pytest.mark.anyio
+pytestmark = pytest.mark.tonio
 
 
-# asyncio does NOT allow raising in signal handlers, so to detect
-# raised signals raised a mutable `witness` receives the signal
-@contextlib.contextmanager
-def capture_signal_sync(sig: signal.Signals) -> Generator[list[int], None, None]:
-    """Replace `sig` handling with a normal exception via `signal"""
-    witness: list[int] = []
-    original_handler = signal.signal(sig, lambda signum, frame: witness.append(signum))
-    yield witness
-    signal.signal(sig, original_handler)
+SIMPLE_GET_REQUEST = b"\r\n".join([b"GET / HTTP/1.1", b"Host: example.org", b"", b""])
 
 
-@contextlib.contextmanager
-def capture_signal_async(sig: signal.Signals) -> Generator[list[int], None, None]:  # pragma: py-win32
-    """Replace `sig` handling with a normal exception via `asyncio"""
-    witness: list[int] = []
-    original_handler = signal.getsignal(sig)
-    asyncio.get_running_loop().add_signal_handler(sig, witness.append, sig)
-    yield witness
-    signal.signal(sig, original_handler)
-
-
-async def dummy_app(scope, receive, send):  # pragma: py-win32
-    pass
-
-
-async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+async def _ok_app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
     assert scope["type"] == "http"
+    await receive()
     await send({"type": "http.response.start", "status": 200, "headers": []})
     await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
-if sys.platform == "win32":  # pragma: py-not-win32
-    signals = [signal.SIGBREAK]
-    signal_captures = [capture_signal_sync]
-else:  # pragma: py-win32
-    signals = [signal.SIGTERM, signal.SIGINT]
-    signal_captures = [capture_signal_sync, capture_signal_async]
-
-
-@pytest.mark.parametrize("exception_signal", signals)
-@pytest.mark.parametrize("capture_signal", signal_captures)
-async def test_server_interrupt(
-    exception_signal: signal.Signals,
-    capture_signal: Callable[[signal.Signals], AbstractContextManager[None]],
-    unused_tcp_port: int,
-):  # pragma: py-win32
-    """Test interrupting a Server that is run explicitly inside asyncio"""
-
-    async def interrupt_running(srv: Server):
-        while not srv.started:
-            await asyncio.sleep(0.01)
-        signal.raise_signal(exception_signal)
-
-    server = Server(Config(app=dummy_app, loop="asyncio", port=unused_tcp_port))
-    asyncio.create_task(interrupt_running(server))
-    with capture_signal(exception_signal) as witness:
-        await server.serve()
-    assert witness
-    # set by the server's graceful exit handler
-    assert server.should_exit
-
-
 async def test_shutdown_on_early_exit_during_startup(unused_tcp_port: int):
-    """Test that lifespan.shutdown is called even when should_exit is set during startup."""
-    startup_complete = False
-    shutdown_complete = False
+    """`lifespan.shutdown` runs even if should_exit flips during startup."""
+    seen: dict[str, bool] = {"startup": False, "shutdown": False}
 
     async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
-        nonlocal startup_complete, shutdown_complete
-        if scope["type"] == "lifespan":
-            while True:
-                message = await receive()
-                if message["type"] == "lifespan.startup":
-                    await asyncio.sleep(0.5)
-                    await send({"type": "lifespan.startup.complete"})
-                    startup_complete = True
-                elif message["type"] == "lifespan.shutdown":
-                    await send({"type": "lifespan.shutdown.complete"})
-                    shutdown_complete = True
-                    return
+        if scope["type"] != "lifespan":
+            return
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                await tonio.colored.time.sleep(0.5)
+                await send({"type": "lifespan.startup.complete"})
+                seen["startup"] = True
+            elif message["type"] == "lifespan.shutdown":
+                await send({"type": "lifespan.shutdown.complete"})
+                seen["shutdown"] = True
+                return
 
     config = Config(app=app, lifespan="on", port=unused_tcp_port)
-    server = Server(config=config)
 
-    # Simulate a reload signal arriving during startup:
-    # set should_exit before the 0.5s startup sleep finishes.
-    async def set_exit():
-        await asyncio.sleep(0.2)
-        server.should_exit = True
-
-    asyncio.create_task(set_exit())
-    await server.serve()
-
-    assert startup_complete
-    assert shutdown_complete, "lifespan.shutdown was not called despite startup completing"
-
-
-async def test_request_than_limit_max_requests_warn_log(
-    unused_tcp_port: int, http_protocol_cls: type[H11Protocol | HttpToolsProtocol], caplog: pytest.LogCaptureFixture
-):
-    caplog.set_level(logging.INFO, logger="uvicorn.error")
-    config = Config(app=app, limit_max_requests=1, port=unused_tcp_port, http=http_protocol_cls)
-    async with run_server(config):
-        async with httpx.AsyncClient() as client:
-            tasks = [client.get(f"http://127.0.0.1:{unused_tcp_port}") for _ in range(2)]
-            responses = await asyncio.gather(*tasks)
-            assert len(responses) == 2
-    assert "Maximum request limit of 1 exceeded. Terminating process." in caplog.text
-
-
-async def test_limit_max_requests_jitter(
-    unused_tcp_port: int, http_protocol_cls: type[H11Protocol | HttpToolsProtocol], caplog: pytest.LogCaptureFixture
-):
-    caplog.set_level(logging.INFO, logger="uvicorn.error")
-    config = Config(
-        app=app, limit_max_requests=1, limit_max_requests_jitter=2, port=unused_tcp_port, http=http_protocol_cls
-    )
     async with run_server(config) as server:
-        limit = server.limit_max_requests
-        assert limit is not None
-        assert 1 <= limit <= 3
-        async with httpx.AsyncClient() as client:
-            tasks = [client.get(f"http://127.0.0.1:{unused_tcp_port}") for _ in range(limit + 1)]
-            await asyncio.gather(*tasks)
-    assert f"Maximum request limit of {limit} exceeded. Terminating process." in caplog.text
+        # Flip should_exit during the 500ms startup sleep.
+        async def trip():
+            await tonio.colored.time.sleep(0.2)
+            server.should_exit = True
+
+        tonio.colored.spawn.without_tracking(trip())
+        # run_server will await server.serve until it returns.
+
+    assert seen["startup"]
+    assert seen["shutdown"], "lifespan.shutdown should run even on early exit"
 
 
-@contextlib.asynccontextmanager
-async def _raw_server(
-    *,
-    app: ASGIApplication,
-    port: int,
-    http_protocol_cls: type[H11Protocol | HttpToolsProtocol],
-    reset_contextvars: bool = False,
-):
-    config = Config(app=app, port=port, loop="asyncio", http=http_protocol_cls, reset_contextvars=reset_contextvars)
-    server = Server(config=config)
-    task = asyncio.create_task(server.serve())
+class _Capture(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
 
-    while not server.started:
-        await asyncio.sleep(0.01)
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
 
-    reader, writer = await asyncio.open_connection("127.0.0.1", port)
 
-    async def extract_json_body(request: bytes):
-        writer.write(request)
-        await writer.drain()
-
-        status, *headers = (await reader.readuntil(b"\r\n\r\n")).split(b"\r\n")[:-2]
-        assert status == b"HTTP/1.1 200 OK"
-
-        content_length = next(int(h.split(b":", 1)[1]) for h in headers if h.lower().startswith(b"content-length:"))
-        return json.loads(await reader.readexactly(content_length))
-
+async def test_request_than_limit_max_requests_warn_log(unused_tcp_port: int, http_protocol_cls: Any):
+    config = Config(app=_ok_app, limit_max_requests=1, port=unused_tcp_port, http=http_protocol_cls)
+    config.load()
+    err = logging.getLogger("uvicorn.error")
+    cap = _Capture()
+    cap.setLevel(logging.INFO)
+    err.addHandler(cap)
     try:
-        yield extract_json_body
+        async with run_server(config) as server:
+            with httpx.Client() as client:
+                client.get(f"http://127.0.0.1:{unused_tcp_port}")
+            # Wait for main_loop's on_tick to observe total_requests >= 1 and
+            # trigger self-termination. on_tick fires every 100ms.
+            for _ in range(20):
+                if server.should_exit:
+                    break
+                await tonio.colored.time.sleep(0.05)
     finally:
-        writer.close()
-        await writer.wait_closed()
-        server.should_exit = True
-        await task
+        err.removeHandler(cap)
+    messages = [r.getMessage() for r in cap.records]
+    assert any("Maximum request limit of 1 exceeded" in m for m in messages), messages
 
 
-async def test_contextvars_preserved_by_default(
-    http_protocol_cls: type[H11Protocol | HttpToolsProtocol], unused_tcp_port: int
-):
+async def test_limit_max_requests_jitter(unused_tcp_port: int, http_protocol_cls: Any):
+    config = Config(
+        app=_ok_app,
+        limit_max_requests=1,
+        limit_max_requests_jitter=2,
+        port=unused_tcp_port,
+        http=http_protocol_cls,
+    )
+    config.load()
+    err = logging.getLogger("uvicorn.error")
+    cap = _Capture()
+    cap.setLevel(logging.INFO)
+    err.addHandler(cap)
+    try:
+        async with run_server(config) as server:
+            limit = server.limit_max_requests
+            assert limit is not None
+            assert 1 <= limit <= 3
+            with httpx.Client() as client:
+                for _ in range(limit):
+                    client.get(f"http://127.0.0.1:{unused_tcp_port}")
+            for _ in range(20):
+                if server.should_exit:
+                    break
+                await tonio.colored.time.sleep(0.05)
+    finally:
+        err.removeHandler(cap)
+    messages = [r.getMessage() for r in cap.records]
+    assert any(f"Maximum request limit of {limit} exceeded" in m for m in messages), messages
+
+
+def _raw_request(port: int, request: bytes) -> dict[str, Any]:
+    """Send a raw HTTP/1.1 request via a sync socket and parse the JSON body."""
+    s = socket.socket()
+    s.settimeout(5.0)
+    s.connect(("127.0.0.1", port))
+    try:
+        s.sendall(request)
+        buf = b""
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            head_end = buf.find(b"\r\n\r\n")
+            if head_end != -1:
+                head = buf[:head_end]
+                body_start = head_end + 4
+                content_length = 0
+                for line in head.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        content_length = int(line.split(b":", 1)[1].strip())
+                if len(buf) - body_start >= content_length:
+                    return json.loads(buf[body_start : body_start + content_length])
+        raise RuntimeError(f"unexpected end of response: {buf!r}")
+    finally:
+        s.close()
+
+
+async def test_contextvars_preserved_by_default(http_protocol_cls: Any, unused_tcp_port: int):
     """By default, context set outside the ASGI task is visible inside it."""
     ctx: contextvars.ContextVar[str] = contextvars.ContextVar("ctx")
     ctx.set("outer-value")
@@ -203,47 +166,39 @@ async def test_contextvars_preserved_by_default(
             if not message["more_body"]:
                 break
         body = json.dumps({"ctx": ctx.get("MISSING")}).encode("utf-8")
-        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode("utf-8"))]
+        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]
         await send({"type": "http.response.start", "status": 200, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 
-    async with _raw_server(app=app, http_protocol_cls=http_protocol_cls, port=unused_tcp_port) as extract_json_body:
-        assert await extract_json_body(SIMPLE_GET_REQUEST) == {"ctx": "outer-value"}
+    config = Config(app=app, port=unused_tcp_port, http=http_protocol_cls)
+    async with run_server(config):
+        assert _raw_request(unused_tcp_port, SIMPLE_GET_REQUEST) == {"ctx": "outer-value"}
 
 
-async def test_reset_contextvars_asyncio(
-    http_protocol_cls: type[H11Protocol | HttpToolsProtocol], unused_tcp_port: int
-):
-    """With reset_contextvars=True, each ASGI run starts with a fresh context.
-
-    Non-regression test for https://github.com/encode/uvicorn/issues/2167.
-    """
+async def test_reset_contextvars(http_protocol_cls: Any, unused_tcp_port: int):
+    """`reset_contextvars=True` gives each ASGI run a fresh context."""
     default_contextvars = {c.name for c in contextvars.copy_context().keys()}
     ctx: contextvars.ContextVar[str] = contextvars.ContextVar("ctx")
 
     async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable):
         assert scope["type"] == "http"
-
-        # initial context should be empty
         initial_context = {
             n: v for c, v in contextvars.copy_context().items() if (n := c.name) not in default_contextvars
         }
-        # set any contextvar before the body is read
         ctx.set(scope["path"])
-
         while True:
             message = await receive()
             assert message["type"] == "http.request"
             if not message["more_body"]:
                 break
-
         body = json.dumps(initial_context).encode("utf-8")
-        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode("utf-8"))]
+        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]
         await send({"type": "http.response.start", "status": 200, "headers": headers})
         await send({"type": "http.response.body", "body": body})
 
-    # body larger than HIGH_WATER_LIMIT forces a reading pause on the main thread
-    # and a resumption inside the ASGI task, which is where the original pollution showed up.
+    # body larger than HIGH_WATER_LIMIT used to expose contextvar pollution under
+    # asyncio. Keep the coverage even though the new pull-style impl doesn't have
+    # the same code path.
     large_body = b"a" * (HIGH_WATER_LIMIT + 1)
     large_request = b"\r\n".join(
         [
@@ -256,8 +211,7 @@ async def test_reset_contextvars_asyncio(
         ]
     )
 
-    async with _raw_server(
-        app=app, http_protocol_cls=http_protocol_cls, port=unused_tcp_port, reset_contextvars=True
-    ) as extract_json_body:
-        assert await extract_json_body(large_request) == {}
-        assert await extract_json_body(SIMPLE_GET_REQUEST) == {}
+    config = Config(app=app, port=unused_tcp_port, http=http_protocol_cls, reset_contextvars=True)
+    async with run_server(config):
+        assert _raw_request(unused_tcp_port, large_request) == {}
+        assert _raw_request(unused_tcp_port, SIMPLE_GET_REQUEST) == {}

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import socket
-from asyncio import Transport
 from typing import Any
 
 import pytest
@@ -9,78 +8,66 @@ import pytest
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_remote_addr
 
 
-class MockSocket:
+class FakeSocket:
     def __init__(
         self,
-        family: socket.AddressFamily,
-        peername: tuple[str, int] | None = None,
+        family: socket.AddressFamily = socket.AF_INET,
+        peername: tuple[str, int] | str | None = None,
         sockname: tuple[str, int] | str | None = None,
     ):
-        self.peername = peername
-        self.sockname = sockname
         self.family = family
+        self._peername = peername
+        self._sockname = sockname
 
-    def getpeername(self):
-        return self.peername
+    def getpeername(self) -> Any:
+        if self._peername is None:
+            raise OSError
+        return self._peername
 
-    def getsockname(self):
-        return self.sockname
-
-
-class MockTransport(Transport):
-    def __init__(self, info: dict[str, Any]) -> None:
-        self.info = info
-
-    def get_extra_info(self, name: str, default: Any = None) -> Any:
-        return self.info.get(name)
+    def getsockname(self) -> Any:
+        if self._sockname is None:
+            raise OSError
+        return self._sockname
 
 
-def test_get_local_addr_with_socket():
-    transport = MockTransport({"socket": MockSocket(family=socket.AF_IPX)})
-    assert get_local_addr(transport) is None
-
-    transport = MockTransport({"socket": MockSocket(family=socket.AF_INET6, sockname=("::1", 123))})
-    assert get_local_addr(transport) == ("::1", 123)
-
-    transport = MockTransport({"socket": MockSocket(family=socket.AF_INET, sockname=("123.45.6.7", 123))})
-    assert get_local_addr(transport) == ("123.45.6.7", 123)
-
-    transport = MockTransport({"socket": MockSocket(family=socket.AF_INET, sockname="/tmp/test.sock")})
-    assert get_local_addr(transport) == ("/tmp/test.sock", None)
+class FakeStream:
+    def __init__(self, sock: FakeSocket) -> None:
+        self.socket = sock
 
 
-def test_get_remote_addr_with_socket():
-    transport = MockTransport({"socket": MockSocket(family=socket.AF_IPX)})
-    assert get_remote_addr(transport) is None
-
-    transport = MockTransport({"socket": MockSocket(family=socket.AF_INET6, peername=("::1", 123))})
-    assert get_remote_addr(transport) == ("::1", 123)
-
-    transport = MockTransport({"socket": MockSocket(family=socket.AF_INET, peername=("123.45.6.7", 123))})
-    assert get_remote_addr(transport) == ("123.45.6.7", 123)
-
-    if hasattr(socket, "AF_UNIX"):  # pragma: no cover
-        transport = MockTransport({"socket": MockSocket(family=socket.AF_UNIX, peername=("127.0.0.1", 8000))})
-        assert get_remote_addr(transport) == ("127.0.0.1", 8000)
+def test_get_local_addr_ipv4():
+    stream = FakeStream(FakeSocket(sockname=("127.0.0.1", 80)))
+    assert get_local_addr(stream) == ("127.0.0.1", 80)
 
 
-def test_get_local_addr():
-    transport = MockTransport({"sockname": "path/to/unix-domain-socket"})
-    assert get_local_addr(transport) == ("path/to/unix-domain-socket", None)
-
-    transport = MockTransport({"sockname": ("123.45.6.7", 123)})
-    assert get_local_addr(transport) == ("123.45.6.7", 123)
-
-    transport = MockTransport({})
-    assert get_local_addr(transport) is None
+def test_get_local_addr_ipv6():
+    stream = FakeStream(FakeSocket(family=socket.AF_INET6, sockname=("::1", 80)))
+    assert get_local_addr(stream) == ("::1", 80)
 
 
-def test_get_remote_addr():
-    transport = MockTransport({"peername": None})
-    assert get_remote_addr(transport) is None
+def test_get_local_addr_unix():
+    stream = FakeStream(FakeSocket(sockname="/tmp/test.sock"))
+    assert get_local_addr(stream) == ("/tmp/test.sock", None)
 
-    transport = MockTransport({"peername": ("123.45.6.7", 123)})
-    assert get_remote_addr(transport) == ("123.45.6.7", 123)
+
+def test_get_local_addr_returns_none_on_oserror():
+    stream = FakeStream(FakeSocket())
+    assert get_local_addr(stream) is None
+
+
+def test_get_remote_addr_ipv4():
+    stream = FakeStream(FakeSocket(peername=("123.45.6.7", 123)))
+    assert get_remote_addr(stream) == ("123.45.6.7", 123)
+
+
+def test_get_remote_addr_ipv6():
+    stream = FakeStream(FakeSocket(family=socket.AF_INET6, peername=("::1", 80)))
+    assert get_remote_addr(stream) == ("::1", 80)
+
+
+def test_get_remote_addr_returns_none_on_oserror():
+    stream = FakeStream(FakeSocket())
+    assert get_remote_addr(stream) is None
 
 
 @pytest.mark.parametrize(

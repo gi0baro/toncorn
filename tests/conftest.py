@@ -2,15 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
-import os
 import socket
 import ssl
 from copy import deepcopy
-from hashlib import md5
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
-from uuid import uuid4
 
 import pytest
 
@@ -177,41 +172,6 @@ def logging_config() -> dict[str, Any]:
     return deepcopy(LOGGING_CONFIG)
 
 
-@pytest.fixture
-def short_socket_name(tmp_path, tmp_path_factory):  # pragma: py-win32
-    max_sock_len = 100
-    socket_filename = "my.sock"
-    identifier = f"{uuid4()}-"
-    identifier_len = len(identifier.encode())
-    tmp_dir = Path("/tmp").resolve()
-    os_tmp_dir = Path(os.getenv("TMPDIR", "/tmp")).resolve()
-    basetemp = Path(
-        str(tmp_path_factory.getbasetemp()),
-    ).resolve()
-    hash_basetemp = md5(
-        str(basetemp).encode(),
-    ).hexdigest()
-
-    def make_tmp_dir(base_dir):
-        return TemporaryDirectory(
-            dir=str(base_dir),
-            prefix="p-",
-            suffix=f"-{hash_basetemp}",
-        )
-
-    paths = basetemp, os_tmp_dir, tmp_dir
-    for _num, tmp_dir_path in enumerate(paths, 1):
-        with make_tmp_dir(tmp_dir_path) as tmpd:
-            tmpd = Path(tmpd).resolve()
-            sock_path = str(tmpd / socket_filename)
-            sock_path_len = len(sock_path.encode())
-            if sock_path_len <= max_sock_len:
-                if max_sock_len - sock_path_len >= identifier_len:  # pragma: no cover
-                    sock_path = str(tmpd / "".join((identifier, socket_filename)))
-                yield sock_path
-                return
-
-
 def _unused_port(socket_type: int) -> int:
     """Find an unused localhost port from 1024-65535 and return it."""
     with contextlib.closing(socket.socket(type=socket_type)) as sock:
@@ -229,14 +189,11 @@ def unused_tcp_port() -> int:
 @pytest.fixture(
     params=[
         pytest.param(
-            "uvicorn.protocols.websockets.wsproto_impl:WSProtocol",
+            "uvicorn.protocols.websockets.wsproto_impl:handle",
             marks=pytest.mark.skipif(not importlib.util.find_spec("wsproto"), reason="wsproto not installed."),
             id="wsproto",
         ),
-        pytest.param("uvicorn.protocols.websockets.websockets_impl:WebSocketProtocol", id="websockets"),
-        pytest.param(
-            "uvicorn.protocols.websockets.websockets_sansio_impl:WebSocketsSansIOProtocol", id="websockets-sansio"
-        ),
+        pytest.param("uvicorn.protocols.websockets.websockets_sansio_impl:handle", id="websockets-sansio"),
     ]
 )
 def ws_protocol_cls(request: pytest.FixtureRequest):
@@ -246,14 +203,14 @@ def ws_protocol_cls(request: pytest.FixtureRequest):
 @pytest.fixture(
     params=[
         pytest.param(
-            "uvicorn.protocols.http.httptools_impl:HttpToolsProtocol",
+            "uvicorn.protocols.http.httptools_impl:handle",
             marks=pytest.mark.skipif(
                 not importlib.util.find_spec("httptools"),
                 reason="httptools not installed.",
             ),
             id="httptools",
         ),
-        pytest.param("uvicorn.protocols.http.h11_impl:H11Protocol", id="h11"),
+        pytest.param("uvicorn.protocols.http.h11_impl:handle", id="h11"),
     ]
 )
 def http_protocol_cls(request: pytest.FixtureRequest):

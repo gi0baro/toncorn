@@ -1,15 +1,10 @@
 from __future__ import annotations
 
-import asyncio
-
-AutoHTTPProtocol: type[asyncio.Protocol]
 try:
-    import httptools  # noqa
+    import httptools  # noqa: F401
 except ImportError:  # pragma: no cover
-    from uvicorn.protocols.http.h11_impl import H11Protocol
+    from uvicorn.protocols.http.h11_impl import handle as AutoHTTPProtocol
+else:
+    from uvicorn.protocols.http.httptools_impl import handle as AutoHTTPProtocol
 
-    AutoHTTPProtocol = H11Protocol
-else:  # pragma: no cover
-    from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
-
-    AutoHTTPProtocol = HttpToolsProtocol
+__all__ = ["AutoHTTPProtocol"]

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import logging
-from asyncio import Queue
 from typing import Any
+
+import tonio.colored
+from tonio.colored.sync.channel import unbounded as _unbounded_channel
 
 from uvicorn import Config
 from uvicorn._types import (
@@ -35,9 +36,11 @@ class LifespanOn:
 
         self.config = config
         self.logger = logging.getLogger("uvicorn.error")
-        self.startup_event = asyncio.Event()
-        self.shutdown_event = asyncio.Event()
-        self.receive_queue: Queue[LifespanReceiveMessage] = asyncio.Queue()
+        self.startup_event = tonio.colored.Event()
+        self.shutdown_event = tonio.colored.Event()
+        sender, receiver = _unbounded_channel()
+        self._recv_send = sender
+        self._recv_recv = receiver
         self.error_occurred = False
         self.startup_failed = False
         self.shutdown_failed = False
@@ -47,12 +50,9 @@ class LifespanOn:
     async def startup(self) -> None:
         self.logger.info("Waiting for application startup.")
 
-        loop = asyncio.get_event_loop()
-        main_lifespan_task = loop.create_task(self.main())  # noqa: F841
-        # Keep a hard reference to prevent garbage collection
-        # See https://github.com/Kludex/uvicorn/pull/972
+        tonio.colored.spawn.without_tracking(self.main())
         startup_event: LifespanStartupEvent = {"type": "lifespan.startup"}
-        await self.receive_queue.put(startup_event)
+        self._recv_send.send(startup_event)
         await self.startup_event.wait()
 
         if self.startup_failed or (self.error_occurred and self.config.lifespan == "on"):
@@ -66,7 +66,7 @@ class LifespanOn:
             return
         self.logger.info("Waiting for application shutdown.")
         shutdown_event: LifespanShutdownEvent = {"type": "lifespan.shutdown"}
-        await self.receive_queue.put(shutdown_event)
+        self._recv_send.send(shutdown_event)
         await self.shutdown_event.wait()
 
         if self.shutdown_failed or (self.error_occurred and self.config.lifespan == "on"):
@@ -134,4 +134,4 @@ class LifespanOn:
                 self.logger.error(message["message"])
 
     async def receive(self) -> LifespanReceiveMessage:
-        return await self.receive_queue.get()
+        return await self._recv_recv.receive()

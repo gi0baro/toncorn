@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import ipaddress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
-import websockets.client
 
 from tests.response import Response
 from tests.utils import run_server
@@ -15,10 +14,7 @@ from uvicorn.config import Config
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware, _TrustedHosts
 
 if TYPE_CHECKING:
-    from uvicorn.protocols.http.h11_impl import H11Protocol
-    from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
-    from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol
-    from uvicorn.protocols.websockets.wsproto_impl import WSProtocol
+    pass
 
 
 X_FORWARDED_FOR = "X-Forwarded-For"
@@ -502,7 +498,7 @@ async def test_proxy_headers_x_forwarded_for_port_shapes(forwarded_for: str, exp
     assert response.text == expected
 
 
-@pytest.mark.anyio
+@pytest.mark.tonio
 @pytest.mark.parametrize(
     "forwarded_proto,expected",
     [
@@ -515,15 +511,18 @@ async def test_proxy_headers_x_forwarded_for_port_shapes(forwarded_for: str, exp
 async def test_proxy_headers_websocket_x_forwarded_proto(
     forwarded_proto: str,
     expected: str,
-    ws_protocol_cls: type[WSProtocol | WebSocketProtocol],
-    http_protocol_cls: type[H11Protocol | HttpToolsProtocol],
+    ws_protocol_cls: Any,
+    http_protocol_cls: Any,
     unused_tcp_port: int,
 ) -> None:
+    import websockets.sync.client
+
     async def websocket_app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
         assert scope["type"] == "websocket"
         scheme = scope["scheme"]
         assert scope["client"] is not None
         host, port = scope["client"]
+        await receive()
         await send({"type": "websocket.accept"})
         await send({"type": "websocket.send", "text": f"{scheme}://{host}:{port}"})
         await send({"type": "websocket.close"})
@@ -540,8 +539,8 @@ async def test_proxy_headers_websocket_x_forwarded_proto(
     async with run_server(config):
         url = f"ws://127.0.0.1:{unused_tcp_port}"
         headers = {X_FORWARDED_FOR: "1.2.3.4", X_FORWARDED_PROTO: forwarded_proto}
-        async with websockets.client.connect(url, extra_headers=headers) as websocket:
-            data = await websocket.recv()
+        with websockets.sync.client.connect(url, additional_headers=headers) as websocket:
+            data = websocket.recv()
             assert data == expected
 
 

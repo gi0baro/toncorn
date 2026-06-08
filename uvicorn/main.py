@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import platform
 import ssl
 import sys
 import warnings
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from configparser import RawConfigParser
 from typing import IO, Any, get_args
 
@@ -25,11 +24,9 @@ from uvicorn.config import (
     HTTPProtocolType,
     InterfaceType,
     LifespanType,
-    LoopFactoryType,
     WSProtocolType,
 )
 from uvicorn.server import Server
-from uvicorn.supervisors import ChangeReload, Multiprocess
 
 LEVEL_CHOICES = click.Choice(list(LOG_LEVELS.keys()))
 LIFESPAN_CHOICES = click.Choice(list(LIFESPAN.keys()))
@@ -48,9 +45,12 @@ logger = logging.getLogger("uvicorn.error")
 def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> None:
     if not value or ctx.resilient_parsing:
         return
+    import toncorn
+
     click.echo(
-        "Running uvicorn {version} with {py_implementation} {py_version} on {system}".format(  # noqa: UP032
-            version=uvicorn.__version__,
+        "Running toncorn {tc_version} (uvicorn {uv_version}) with {py_implementation} {py_version} on {system}".format(  # noqa: UP032
+            tc_version=toncorn.__version__,
+            uv_version=uvicorn.__version__,
             py_implementation=platform.python_implementation(),
             py_version=platform.python_version(),
             system=platform.system(),
@@ -61,13 +61,7 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
 
 @click.command(context_settings={"auto_envvar_prefix": "UVICORN"})
 @click.argument("app", envvar="UVICORN_APP")
-@click.option(
-    "--host",
-    type=str,
-    default="127.0.0.1",
-    help="Bind socket to this host.",
-    show_default=True,
-)
+@click.option("--host", type=str, default="127.0.0.1", help="Bind socket to this host.", show_default=True)
 @click.option(
     "--port",
     type=int,
@@ -76,53 +70,12 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
     show_default=True,
 )
 @click.option("--uds", type=str, default=None, help="Bind to a UNIX domain socket.")
-@click.option("--fd", type=int, default=None, help="Bind to socket from this file descriptor.")
-@click.option("--reload", is_flag=True, default=False, help="Enable auto-reload.")
 @click.option(
-    "--reload-dir",
-    "reload_dirs",
-    multiple=True,
-    help="Set reload directories explicitly, instead of using the current working directory.",
-    type=click.Path(exists=True),
-)
-@click.option(
-    "--reload-include",
-    "reload_includes",
-    multiple=True,
-    help="Set glob patterns to include while watching for files. Includes '*.py' "
-    "by default; these defaults can be overridden with `--reload-exclude`. "
-    "This option has no effect unless watchfiles is installed.",
-)
-@click.option(
-    "--reload-exclude",
-    "reload_excludes",
-    multiple=True,
-    help="Set glob patterns to exclude while watching for files. Includes "
-    "'.*, .py[cod], .sw.*, ~*' by default; these defaults can be overridden "
-    "with `--reload-include`. This option has no effect unless watchfiles is "
-    "installed.",
-)
-@click.option(
-    "--reload-delay",
-    type=float,
-    default=0.25,
-    show_default=True,
-    help="Delay between previous and next check if application needs to be. Defaults to 0.25s.",
-)
-@click.option(
-    "--workers",
+    "--threads",
     default=None,
     type=int,
-    help="Number of worker processes. Defaults to the $WEB_CONCURRENCY environment"
-    " variable if available, or 1. Not valid with --reload.",
-)
-@click.option(
-    "--loop",
-    type=str,
-    metavar=_metavar_from_type(LoopFactoryType),
-    default="auto",
-    help="Event loop factory implementation.",
-    show_default=True,
+    help="Number of runtime threads. Defaults to the $WEB_CONCURRENCY environment "
+    "variable if available, or the tonio runtime default (CPU count).",
 )
 @click.option(
     "--http",
@@ -155,18 +108,10 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
     show_default=True,
 )
 @click.option(
-    "--ws-ping-interval",
-    type=float,
-    default=20.0,
-    help="WebSocket ping interval in seconds.",
-    show_default=True,
+    "--ws-ping-interval", type=float, default=20.0, help="WebSocket ping interval in seconds.", show_default=True
 )
 @click.option(
-    "--ws-ping-timeout",
-    type=float,
-    default=20.0,
-    help="WebSocket ping timeout in seconds.",
-    show_default=True,
+    "--ws-ping-timeout", type=float, default=20.0, help="WebSocket ping timeout in seconds.", show_default=True
 )
 @click.option(
     "--ws-per-message-deflate",
@@ -175,18 +120,12 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
     help="WebSocket per-message-deflate compression",
     show_default=True,
 )
-@click.option(
-    "--lifespan",
-    type=LIFESPAN_CHOICES,
-    default="auto",
-    help="Lifespan implementation.",
-    show_default=True,
-)
+@click.option("--lifespan", type=LIFESPAN_CHOICES, default="auto", help="Lifespan implementation.", show_default=True)
 @click.option(
     "--interface",
     type=INTERFACE_CHOICES,
     default="auto",
-    help="Select ASGI3, ASGI2, or WSGI as the application interface.",
+    help="Select ASGI3 or ASGI2 as the application interface.",
     show_default=True,
 )
 @click.option(
@@ -210,18 +149,8 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
     help="Log level. [default: info]",
     show_default=True,
 )
-@click.option(
-    "--access-log/--no-access-log",
-    is_flag=True,
-    default=True,
-    help="Enable/Disable access log.",
-)
-@click.option(
-    "--use-colors/--no-use-colors",
-    is_flag=True,
-    default=None,
-    help="Enable/Disable colorized logging.",
-)
+@click.option("--access-log/--no-access-log", is_flag=True, default=True, help="Enable/Disable access log.")
+@click.option("--use-colors/--no-use-colors", is_flag=True, default=None, help="Enable/Disable colorized logging.")
 @click.option(
     "--proxy-headers/--no-proxy-headers",
     is_flag=True,
@@ -261,12 +190,7 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
     default=None,
     help="Maximum number of concurrent connections or tasks to allow, before issuing HTTP 503 responses.",
 )
-@click.option(
-    "--backlog",
-    type=int,
-    default=2048,
-    help="Maximum number of connections to hold in backlog",
-)
+@click.option("--backlog", type=int, default=2048, help="Maximum number of connections to hold in backlog")
 @click.option(
     "--limit-max-requests",
     type=int,
@@ -277,8 +201,7 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
     "--limit-max-requests-jitter",
     type=int,
     default=0,
-    help="Maximum jitter to add to limit_max_requests."
-    " Staggers worker restarts to avoid all workers restarting simultaneously.",
+    help="Maximum jitter to add to limit_max_requests.",
     show_default=True,
 )
 @click.option(
@@ -294,28 +217,9 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
     default=None,
     help="Maximum number of seconds to wait for graceful shutdown.",
 )
-@click.option(
-    "--timeout-worker-healthcheck",
-    type=int,
-    default=5,
-    help="Maximum number of seconds to wait for a worker to respond to a healthcheck.",
-    show_default=True,
-)
 @click.option("--ssl-keyfile", type=str, default=None, help="SSL key file", show_default=True)
-@click.option(
-    "--ssl-certfile",
-    type=str,
-    default=None,
-    help="SSL certificate file",
-    show_default=True,
-)
-@click.option(
-    "--ssl-keyfile-password",
-    type=str,
-    default=None,
-    help="SSL keyfile password",
-    show_default=True,
-)
+@click.option("--ssl-certfile", type=str, default=None, help="SSL certificate file", show_default=True)
+@click.option("--ssl-keyfile-password", type=str, default=None, help="SSL keyfile password", show_default=True)
 @click.option(
     "--ssl-version",
     type=int,
@@ -330,13 +234,7 @@ def print_version(ctx: click.Context, param: click.Parameter, value: bool) -> No
     help="Whether client certificate is required (see stdlib ssl module's)",
     show_default=True,
 )
-@click.option(
-    "--ssl-ca-certs",
-    type=str,
-    default=None,
-    help="CA certificates file",
-    show_default=True,
-)
+@click.option("--ssl-ca-certs", type=str, default=None, help="CA certificates file", show_default=True)
 @click.option(
     "--ssl-ciphers",
     type=str,
@@ -391,8 +289,7 @@ def main(
     host: str,
     port: int,
     uds: str,
-    fd: int,
-    loop: LoopFactoryType | str,
+    threads: int | None,
     http: HTTPProtocolType | str,
     ws: WSProtocolType | str,
     ws_max_size: int,
@@ -402,12 +299,6 @@ def main(
     ws_per_message_deflate: bool,
     lifespan: LifespanType,
     interface: InterfaceType,
-    reload: bool,
-    reload_dirs: list[str],
-    reload_includes: list[str],
-    reload_excludes: list[str],
-    reload_delay: float,
-    workers: int,
     env_file: str,
     log_config: str,
     log_level: str,
@@ -423,7 +314,6 @@ def main(
     limit_max_requests_jitter: int,
     timeout_keep_alive: int,
     timeout_graceful_shutdown: int | None,
-    timeout_worker_healthcheck: int,
     ssl_keyfile: str,
     ssl_certfile: str,
     ssl_keyfile_password: str,
@@ -443,8 +333,7 @@ def main(
         host=host,
         port=port,
         uds=uds,
-        fd=fd,
-        loop=loop,
+        threads=threads,
         http=http,
         ws=ws,
         ws_max_size=ws_max_size,
@@ -458,12 +347,6 @@ def main(
         log_level=log_level,
         access_log=access_log,
         interface=interface,
-        reload=reload,
-        reload_dirs=reload_dirs or None,
-        reload_includes=reload_includes or None,
-        reload_excludes=reload_excludes or None,
-        reload_delay=reload_delay,
-        workers=workers,
         proxy_headers=proxy_headers,
         server_header=server_header,
         date_header=date_header,
@@ -475,7 +358,6 @@ def main(
         limit_max_requests_jitter=limit_max_requests_jitter,
         timeout_keep_alive=timeout_keep_alive,
         timeout_graceful_shutdown=timeout_graceful_shutdown,
-        timeout_worker_healthcheck=timeout_worker_healthcheck,
         ssl_keyfile=ssl_keyfile,
         ssl_certfile=ssl_certfile,
         ssl_keyfile_password=ssl_keyfile_password,
@@ -498,10 +380,8 @@ def run(
     host: str = "127.0.0.1",
     port: int = 8000,
     uds: str | None = None,
-    fd: int | None = None,
-    loop: LoopFactoryType | str = "auto",
-    http: type[asyncio.Protocol] | HTTPProtocolType | str = "auto",
-    ws: type[asyncio.Protocol] | WSProtocolType | str = "auto",
+    http: HTTPProtocolType | str | Callable[..., Awaitable[None]] = "auto",
+    ws: WSProtocolType | str | Callable[..., Awaitable[None]] | None = "auto",
     ws_max_size: int = 16777216,
     ws_max_queue: int = 32,
     ws_ping_interval: float | None = 20.0,
@@ -509,12 +389,7 @@ def run(
     ws_per_message_deflate: bool = True,
     lifespan: LifespanType = "auto",
     interface: InterfaceType = "auto",
-    reload: bool = False,
-    reload_dirs: list[str] | str | None = None,
-    reload_includes: list[str] | str | None = None,
-    reload_excludes: list[str] | str | None = None,
-    reload_delay: float = 0.25,
-    workers: int | None = None,
+    threads: int | None = None,
     env_file: str | os.PathLike[str] | None = None,
     log_config: dict[str, Any] | str | os.PathLike[str] | RawConfigParser | IO[Any] | None = LOGGING_CONFIG,
     log_level: str | int | None = None,
@@ -530,7 +405,6 @@ def run(
     limit_max_requests_jitter: int = 0,
     timeout_keep_alive: int = 5,
     timeout_graceful_shutdown: int | None = None,
-    timeout_worker_healthcheck: int = 5,
     ssl_keyfile: str | os.PathLike[str] | None = None,
     ssl_certfile: str | os.PathLike[str] | None = None,
     ssl_keyfile_password: str | None = None,
@@ -554,8 +428,6 @@ def run(
         host=host,
         port=port,
         uds=uds,
-        fd=fd,
-        loop=loop,
         http=http,
         ws=ws,
         ws_max_size=ws_max_size,
@@ -565,12 +437,7 @@ def run(
         ws_per_message_deflate=ws_per_message_deflate,
         lifespan=lifespan,
         interface=interface,
-        reload=reload,
-        reload_dirs=reload_dirs,
-        reload_includes=reload_includes,
-        reload_excludes=reload_excludes,
-        reload_delay=reload_delay,
-        workers=workers,
+        threads=threads,
         env_file=env_file,
         log_config=log_config,
         log_level=log_level,
@@ -586,7 +453,6 @@ def run(
         limit_max_requests_jitter=limit_max_requests_jitter,
         timeout_keep_alive=timeout_keep_alive,
         timeout_graceful_shutdown=timeout_graceful_shutdown,
-        timeout_worker_healthcheck=timeout_worker_healthcheck,
         ssl_keyfile=ssl_keyfile,
         ssl_certfile=ssl_certfile,
         ssl_keyfile_password=ssl_keyfile_password,
@@ -601,30 +467,19 @@ def run(
         h11_max_incomplete_event_size=h11_max_incomplete_event_size,
         reset_contextvars=reset_contextvars,
     )
-    if (config.reload or config.workers > 1) and not isinstance(app, str):
-        logger = logging.getLogger("uvicorn.error")
-        logger.warning("You must pass the application as an import string to enable 'reload' or 'workers'.")
-        sys.exit(1)
 
     config.load_app()
     server = Server(config=config)
 
     try:
-        if config.should_reload:
-            sock = config.bind_socket()
-            ChangeReload(config, target=server.run, sockets=[sock]).run()
-        elif config.workers > 1:
-            sock = config.bind_socket()
-            Multiprocess(config, target=server.run, sockets=[sock]).run()
-        else:
-            server.run()
+        server.run()
     except KeyboardInterrupt:  # pragma: full coverage
         pass
     finally:
         if config.uds and os.path.exists(config.uds):
-            os.remove(config.uds)  # pragma: py-win32
+            os.remove(config.uds)
 
-    if not server.started and not config.should_reload and config.workers == 1:
+    if not server.started:
         sys.exit(STARTUP_FAILURE)
 
 

@@ -34,7 +34,7 @@ def message_with_placeholders(message: Any) -> Any:
 
 
 class MessageLoggerMiddleware:
-    def __init__(self, app: "ASGI3Application"):
+    def __init__(self, app: ASGI3Application):
         self.task_counter = 0
         self.app = app
         self.logger = logging.getLogger("uvicorn.asgi")
@@ -46,9 +46,9 @@ class MessageLoggerMiddleware:
 
     async def __call__(
         self,
-        scope: "WWWScope",
-        receive: "ASGIReceiveCallable",
-        send: "ASGISendCallable",
+        scope: WWWScope,
+        receive: ASGIReceiveCallable,
+        send: ASGISendCallable,
     ) -> None:
         self.task_counter += 1
 
@@ -56,7 +56,7 @@ class MessageLoggerMiddleware:
         client = scope.get("client")
         prefix = "%s:%d - ASGI" % (client[0], client[1]) if client else "ASGI"
 
-        async def inner_receive() -> "ASGIReceiveEvent":
+        async def inner_receive() -> ASGIReceiveEvent:
             message = await receive()
             logged_message = message_with_placeholders(message)
             log_text = "%s [%d] Receive %s"
@@ -65,7 +65,7 @@ class MessageLoggerMiddleware:
             )
             return message
 
-        async def inner_send(message: "ASGISendEvent") -> None:
+        async def inner_send(message: ASGISendEvent) -> None:
             logged_message = message_with_placeholders(message)
             log_text = "%s [%d] Send %s"
             self.logger.trace(  # type: ignore

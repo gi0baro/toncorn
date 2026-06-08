@@ -1,10 +1,25 @@
+import contextlib
+import logging
+from collections.abc import Iterator
+
 import httpx
 import pytest
 
-from tests.middleware.test_logging import caplog_for_logger
 from uvicorn._types import ASGIReceiveCallable, ASGISendCallable, Scope
 from uvicorn.logging import TRACE_LOG_LEVEL
 from uvicorn.middleware.message_logger import MessageLoggerMiddleware
+
+
+@contextlib.contextmanager
+def caplog_for_logger(caplog: pytest.LogCaptureFixture, logger_name: str) -> Iterator[pytest.LogCaptureFixture]:
+    logger = logging.getLogger(logger_name)
+    logger.propagate, old_propagate = False, logger.propagate
+    logger.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        logger.removeHandler(caplog.handler)
+        logger.propagate = old_propagate
 
 
 @pytest.mark.anyio
