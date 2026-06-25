@@ -82,9 +82,9 @@ toncorn = "uvicorn.main:main"
 
 [project.urls]
 Changelog = "https://uvicorn.dev/release-notes"
-Funding = "https://github.com/sponsors/encode"
+Funding = "https://github.com/sponsors/Kludex"
 Homepage = "https://uvicorn.dev/"
-Source = "https://github.com/Kludex/uvicorn"
+Source = "https://github.com/gi0baro/toncorn"
 
 [tool.hatch.version]
 source = "code"
