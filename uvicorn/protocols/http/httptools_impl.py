@@ -5,6 +5,7 @@ import contextlib
 import http
 import logging
 import re
+import socket as _stdlib_socket
 import urllib.parse
 from typing import Any, Literal
 
@@ -12,6 +13,8 @@ import httptools
 import tonio
 import tonio.colored
 import tonio.colored.time
+from tonio._tonio import get_runtime as _get_tonio_runtime
+from tonio.colored.net.tls import TLSStream
 
 from uvicorn._types import (
     ASGI3Application,
@@ -50,21 +53,60 @@ logger = logging.getLogger("uvicorn.error")
 access_logger = logging.getLogger("uvicorn.access")
 
 
+async def _recv_with_timeout_plain(
+    stream: Stream, timeout_seconds: float, runtime: Any, expect_data: bool
+) -> bytes | None:
+    if expect_data:
+        try:
+            return stream.socket._sock.recv(65536, 0)
+        except BlockingIOError, InterruptedError:
+            pass
+
+    fd = stream.socket.fileno()
+    event = runtime._io_event_r(fd)
+    await event.waiter(round(timeout_seconds * 1_000_000))
+    if event.is_set():
+        try:
+            return stream.socket._sock.recv(65536, 0)
+        except BlockingIOError, InterruptedError:
+            pass
+    return None
+
+
+async def _recv_with_timeout_tls(
+    stream: TLSStream, timeout_seconds: float, runtime: Any, expect_data: bool
+) -> bytes | None:
+    data, ok = await tonio.colored.time.timeout(stream.receive_some(), timeout_seconds)
+    return data if ok else None
+
+
 async def handle(
     stream: Stream,
     config: Config,
     server_state: ServerState,
     app_state: dict[str, Any],
 ) -> None:
+    if isinstance(stream, TLSStream):
+        _recv_with_timeout = _recv_with_timeout_tls
+        try:
+            stream.transport.socket.setsockopt(_stdlib_socket.IPPROTO_TCP, _stdlib_socket.TCP_NODELAY, 1)
+        except OSError, NameError:
+            pass
+    else:
+        _recv_with_timeout = _recv_with_timeout_plain
+        try:
+            stream.socket.setsockopt(_stdlib_socket.IPPROTO_TCP, _stdlib_socket.TCP_NODELAY, 1)
+        except OSError, NameError:
+            pass
+
     cb = _Callbacks(config, server_state, app_state, stream)
     parser = httptools.HttpRequestParser(cb)
-    try:
-        parser.set_dangerous_leniencies(lenient_data_after_close=True)
-    except AttributeError:  # pragma: no cover - httptools < 0.6.3
-        pass
+    parser.set_dangerous_leniencies(lenient_data_after_close=True)
     cb.parser = parser
 
     access_log = access_logger.hasHandlers()
+    runtime = _get_tonio_runtime()
+    expect_data = True
 
     while True:
         # Read bytes from the stream until at least one cycle is dispatched.
@@ -72,10 +114,8 @@ async def handle(
         # have already populated dispatch_queue — in that case we skip the
         # read entirely.
         while not cb.dispatch_queue:
-            data, ok = await tonio.colored.time.timeout(stream.receive_some(), config.timeout_keep_alive)
-            if not ok:
-                return
-            if not data:
+            data = await _recv_with_timeout(stream, config.timeout_keep_alive, runtime, expect_data)
+            if not data:  # EOF
                 return
             try:
                 parser.feed_data(data)
@@ -86,6 +126,7 @@ async def handle(
             except httptools.HttpParserUpgrade:
                 await _handle_upgrade(stream, parser, cb, config, server_state, app_state)
                 return
+            expect_data = False
 
         cycle = cb.dispatch_queue.popleft()
         cycle.stream = stream

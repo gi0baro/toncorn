@@ -14,7 +14,15 @@ import tonio.colored
 
 
 class _FakeSocket:
-    """Mimics enough of tonio's :class:`_Socket` for utils.get_local_addr/_remote_addr."""
+    """Mimics enough of tonio's :class:`_Socket` for utils.get_local_addr /
+    _remote_addr, plus the no-op ``setsockopt`` / ``fileno`` that
+    ``httptools_impl.handle`` calls at connection setup.
+
+    The actual byte-level recv/send happens via :class:`FakeSocketStream`'s
+    ``receive_some`` / ``send_all`` — tests monkey-patch the protocol's
+    receive fast path so the raw ``_sock.recv`` / ``_sock.send`` are never
+    called.
+    """
 
     family = _stdlib_socket.AF_INET
 
@@ -42,6 +50,16 @@ class _FakeSocket:
 
     def close(self) -> None:
         pass
+
+    def setsockopt(self, *args: object) -> None:
+        # No-op: real stdlib sockets accept setsockopt; production code uses
+        # it to flip TCP_NODELAY at connection start. Tests don't care.
+        pass
+
+    def fileno(self) -> int:
+        # Tests bypass the runtime IO reactor by monkey-patching the
+        # protocol's receive fast path; this never gets used as a real fd.
+        return -1
 
 
 class FakeSocketStream:

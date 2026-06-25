@@ -12,15 +12,26 @@ import logging
 from typing import Any
 
 import pytest
+import tonio.colored.time
 
 from tests.protocols._fake_stream import FakeSocketStream
 from tests.response import Response
 from uvicorn._types import ASGIReceiveCallable, ASGISendCallable, Scope
 from uvicorn.config import Config
 from uvicorn.lifespan.off import LifespanOff
+from uvicorn.protocols.http import h11_impl, httptools_impl
 from uvicorn.server import ServerState
 
 pytestmark = pytest.mark.tonio
+
+
+async def _recv_with_timeout(stream, timeout_seconds, runtime, expect_data):
+    data, ok = await tonio.colored.time.timeout(stream.receive_some(), timeout_seconds)
+    return data if ok else None
+
+
+httptools_impl._recv_with_timeout_plain = _recv_with_timeout
+h11_impl._recv_with_timeout_plain = _recv_with_timeout
 
 
 # ---------------------------------------------------------------------------

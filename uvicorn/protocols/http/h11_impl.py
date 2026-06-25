@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import http
 import logging
+import socket as _stdlib_socket
 from typing import Any, Literal
 from urllib.parse import unquote
 
@@ -11,6 +12,8 @@ import tonio
 import tonio.colored
 import tonio.colored.time
 from h11._connection import DEFAULT_MAX_INCOMPLETE_EVENT_SIZE
+from tonio._tonio import get_runtime as _get_tonio_runtime
+from tonio.colored.net.tls import TLSStream
 
 from uvicorn._types import (
     ASGI3Application,
@@ -56,12 +59,52 @@ class _Upgrade:
         self.request_bytes = request_bytes
 
 
+async def _recv_with_timeout_plain(
+    stream: Stream, timeout_seconds: float, runtime: Any, expect_data: bool
+) -> bytes | None:
+    if expect_data:
+        try:
+            return stream.socket._sock.recv(65536, 0)
+        except BlockingIOError, InterruptedError:
+            pass
+
+    fd = stream.socket.fileno()
+    event = runtime._io_event_r(fd)
+    await event.waiter(round(timeout_seconds * 1_000_000))
+    if event.is_set():
+        try:
+            return stream.socket._sock.recv(65536, 0)
+        except BlockingIOError, InterruptedError:
+            pass
+    return None
+
+
+async def _recv_with_timeout_tls(
+    stream: TLSStream, timeout_seconds: float, runtime: Any, expect_data: bool
+) -> bytes | None:
+    data, ok = await tonio.colored.time.timeout(stream.receive_some(), timeout_seconds)
+    return data if ok else None
+
+
 async def handle(
     stream: Stream,
     config: Config,
     server_state: ServerState,
     app_state: dict[str, Any],
 ) -> None:
+    if isinstance(stream, TLSStream):
+        _recv_with_timeout = _recv_with_timeout_tls
+        try:
+            stream.transport.socket.setsockopt(_stdlib_socket.IPPROTO_TCP, _stdlib_socket.TCP_NODELAY, 1)
+        except OSError, NameError:
+            pass
+    else:
+        _recv_with_timeout = _recv_with_timeout_plain
+        try:
+            stream.socket.setsockopt(_stdlib_socket.IPPROTO_TCP, _stdlib_socket.TCP_NODELAY, 1)
+        except OSError, NameError:
+            pass
+
     max_event_size = (
         config.h11_max_incomplete_event_size
         if config.h11_max_incomplete_event_size is not None
@@ -73,9 +116,14 @@ async def handle(
     client_addr = get_remote_addr(stream)
     scheme: Literal["http", "https"] = "https" if is_ssl(stream) else "http"
     access_log = access_logger.hasHandlers()
+    runtime = _get_tonio_runtime()
+    expect_data = True
 
     while True:
-        request = await _read_request_event(stream, conn, config, server_state)
+        request = await _read_request_event(
+            stream, conn, config, server_state, runtime, _recv_with_timeout, expect_data
+        )
+        expect_data = False
         if request is None:
             return
         if isinstance(request, _Upgrade):
@@ -146,11 +194,20 @@ async def _read_request_event(
     conn: h11.Connection,
     config: Config,
     server_state: ServerState,
+    runtime: Any,
+    _recv_with_timeout: Any,
+    expect_data: bool,
 ) -> h11.Request | _Upgrade | None:
     """Drive `conn` until a Request event is available.
 
     Returns the Request, an `_Upgrade` marker for ws upgrades, or `None` if
     the connection should be torn down (idle timeout, EOF, or protocol error).
+
+    ``expect_data`` is True only on the initial call for a fresh connection
+    (the request may already be in the kernel buffer from accept). On
+    subsequent calls, and after any recv inside this function, we know the
+    kernel buffer was just drained and there's no point trying a
+    speculative non-blocking read.
     """
     while True:
         try:
@@ -162,10 +219,10 @@ async def _read_request_event(
 
         if event is h11.NEED_DATA:
             try:
-                data, ok = await tonio.colored.time.timeout(stream.receive_some(), config.timeout_keep_alive)
-                if not ok:
-                    return None
+                data = await _recv_with_timeout(stream, config.timeout_keep_alive, runtime, expect_data)
             except OSError:
+                return None
+            if data is None:  # keep-alive timeout
                 return None
             try:
                 conn.receive_data(data or b"")
@@ -175,6 +232,7 @@ async def _read_request_event(
                 return None
             if not data:
                 return None
+            expect_data = False  # any further recv in this call goes through the slow path
             continue
 
         if isinstance(event, h11.Request):
