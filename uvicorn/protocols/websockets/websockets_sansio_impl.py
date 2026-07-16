@@ -89,6 +89,9 @@ async def handle(
         for key, value in request.headers.raw_items()
     ]
     raw_path, _, query_string = request.path.partition("?")
+    subprotocols: list[str] = []
+    for header in request.headers.get_all("Sec-WebSocket-Protocol"):
+        subprotocols.extend([token.strip() for token in header.split(",")])
     scope: WebSocketScope = {
         "type": "websocket",
         "asgi": {"version": config.asgi_version, "spec_version": "2.4"},
@@ -101,7 +104,7 @@ async def handle(
         "raw_path": config.root_path.encode("ascii") + raw_path.encode("ascii"),
         "query_string": query_string.encode("ascii"),
         "headers": headers,
-        "subprotocols": request.headers.get_all("Sec-WebSocket-Protocol"),
+        "subprotocols": subprotocols,
         "state": app_state.copy(),
         "extensions": {"websocket.http.response": {}},
     }
@@ -163,8 +166,9 @@ class _State:
         self.done = tonio.colored.Event()
         self.initial_response: tuple[int, list[tuple[str, str]], bytes] | None = None
 
-        self.bytes = bytearray()
-        self.curr_msg_data_type: Literal["text", "bytes"] = "text"
+        # Incoming message state
+        self.frames: list[bytes] = []
+        self.curr_msg_data_type: Literal["text", "bytes"] = "bytes"
 
         self.ping_interval = config.ws_ping_interval
         self.ping_timeout = config.ws_ping_timeout
@@ -212,17 +216,17 @@ class _State:
                         return
                     if isinstance(event, Frame):
                         if event.opcode == Opcode.CONT:
-                            self.bytes.extend(event.data)
+                            self.frames.append(event.data)  # type: ignore[arg-type]
                             if event.fin:
                                 self._dispatch_message()
                         elif event.opcode == Opcode.TEXT:
-                            self.bytes = bytearray(event.data)
                             self.curr_msg_data_type = "text"
+                            self.frames = [event.data]  # type: ignore[list-item]
                             if event.fin:
                                 self._dispatch_message()
                         elif event.opcode == Opcode.BINARY:
-                            self.bytes = bytearray(event.data)
                             self.curr_msg_data_type = "bytes"
+                            self.frames = [event.data]  # type: ignore[list-item]
                             if event.fin:
                                 self._dispatch_message()
                         elif event.opcode == Opcode.PING:
@@ -248,16 +252,18 @@ class _State:
             self.done.set()
 
     def _dispatch_message(self) -> None:
+        data = self.frames[0] if len(self.frames) == 1 else b"".join(self.frames)
+        self.frames = []
         if self.curr_msg_data_type == "text":
             try:
-                self.queue_send.send({"type": "websocket.receive", "text": self.bytes.decode()})
+                self.queue_send.send({"type": "websocket.receive", "text": data.decode()})
             except UnicodeDecodeError:  # pragma: no cover
                 logger.exception("Invalid UTF-8 sequence received from client.")
                 self.conn.send_close(1007)
                 self._handle_parser_error()
                 return
         else:
-            self.queue_send.send({"type": "websocket.receive", "bytes": bytes(self.bytes)})
+            self.queue_send.send({"type": "websocket.receive", "bytes": data})
 
     def _handle_parser_error(self) -> None:  # pragma: no cover
         if self.conn.close_sent is not None:

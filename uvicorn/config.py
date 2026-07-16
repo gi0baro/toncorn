@@ -52,6 +52,8 @@ INTERFACES: list[InterfaceType] = ["auto", "asgi3", "asgi2"]
 
 SSL_PROTOCOL_VERSION: int = ssl.PROTOCOL_TLS_SERVER
 
+STARTUP_FAILURE = 3
+
 LOGGING_CONFIG: dict[str, Any] = {
     "version": 1,
     "disable_existing_loggers": False,
@@ -278,7 +280,7 @@ class Config:
             return import_from_string(self.app)
         except ImportFromStringError as exc:
             logger.error("Error loading ASGI app. %s" % exc)
-            sys.exit(1)
+            sys.exit(STARTUP_FAILURE)
 
     def load(self) -> None:
         assert not self.loaded
@@ -348,7 +350,7 @@ class Config:
         except TypeError as exc:
             if self.factory:
                 logger.error("Error loading ASGI app factory: %s", exc)
-                sys.exit(1)
+                sys.exit(STARTUP_FAILURE)
         else:
             if not self.factory:
                 logger.warning(

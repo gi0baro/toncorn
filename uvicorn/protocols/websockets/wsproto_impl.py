@@ -210,6 +210,11 @@ class _State:
                         pass
                     self.client_gone = True
                     return
+                except LocalProtocolError:
+                    # Data received after the close handshake completed, e.g. a pong
+                    # the client sent while the server's close was in flight.
+                    self.client_gone = True
+                    return
                 for event in self.conn.events():
                     if self.close_sent:
                         return

@@ -12,7 +12,7 @@ import uvicorn.server
 from tests.utils import run_server
 from uvicorn import Server
 from uvicorn._types import ASGIReceiveCallable, ASGISendCallable, Scope
-from uvicorn.config import Config
+from uvicorn.config import STARTUP_FAILURE, Config
 from uvicorn.main import run
 
 pytestmark = pytest.mark.tonio
@@ -137,7 +137,7 @@ async def test_exit_on_create_server_with_invalid_host() -> None:
         config = Config(app=app, host="illegal_host")
         server = Server(config=config)
         await server.serve()
-    assert exc_info.value.code == 1
+    assert exc_info.value.code == STARTUP_FAILURE
 
 
 def test_deprecated_server_state_from_main() -> None:

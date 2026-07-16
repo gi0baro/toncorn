@@ -229,6 +229,7 @@ class _Callbacks:
         stream: Stream,
     ) -> None:
         self.config = config
+        self.asgi_version = config.asgi_version
         self.server_state = server_state
         self.app_state = app_state
         self.parser: httptools.HttpRequestParser | None = None
@@ -256,7 +257,7 @@ class _Callbacks:
         self.expect_100_continue = False
         self.scope = {  # type: ignore[typeddict-item]
             "type": "http",
-            "asgi": {"version": self.config.asgi_version, "spec_version": "2.3"},
+            "asgi": {"version": self.asgi_version, "spec_version": "2.3"},
             "http_version": "1.1",
             "server": self.server_addr,
             "client": self.client_addr,

@@ -19,7 +19,7 @@ uvicorn_version: str = _match.group(1)
 
 #: Bump this for toncorn-only patch releases against the same uvicorn baseline.
 #: Resets to 0 each time the upstream uvicorn version changes.
-TONCORN_PATCH: int = 1
+TONCORN_PATCH: int = 0
 
 #: Public toncorn version, e.g. "0.48.0.0".
 __version__: str = f"{uvicorn_version}.{TONCORN_PATCH}"

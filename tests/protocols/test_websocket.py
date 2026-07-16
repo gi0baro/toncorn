@@ -172,10 +172,13 @@ async def test_scope_path_and_headers(ws_protocol_cls: Any, http_protocol_cls: A
 
 
 async def test_subprotocol_negotiation(ws_protocol_cls: Any, http_protocol_cls: Any):
+    advertised: dict[str, list[str]] = {}
+
     async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
         if scope["type"] != "websocket":
             return
         subprotocols = scope["subprotocols"]
+        advertised["subprotocols"] = list(subprotocols)
         await receive()
         chosen = subprotocols[0] if subprotocols else None
         await send({"type": "websocket.accept", "subprotocol": chosen})
@@ -184,10 +187,14 @@ async def test_subprotocol_negotiation(ws_protocol_cls: Any, http_protocol_cls: 
     port = _free_port()
     config = _make_config(app, port, ws_protocol_cls=ws_protocol_cls, http_protocol_cls=http_protocol_cls)
     async with run_server(config):
-        with websockets.sync.client.connect(_ws_url(port), subprotocols=["chat"]) as ws:
+        # The client joins these into one comma-separated Sec-WebSocket-Protocol
+        # header; the server must split them back into individual tokens.
+        with websockets.sync.client.connect(_ws_url(port), subprotocols=["chat", "superchat"]) as ws:
             assert ws.subprotocol == "chat"
             with pytest.raises(websockets.exceptions.ConnectionClosed):
                 ws.recv()
+
+    assert advertised["subprotocols"] == ["chat", "superchat"]
 
 
 # ---------------------------------------------------------------------------

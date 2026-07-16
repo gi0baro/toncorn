@@ -14,7 +14,6 @@ import time
 from collections.abc import Sequence
 from email.utils import formatdate
 
-import click
 import tonio
 import tonio.colored
 import tonio.colored.net
@@ -24,7 +23,8 @@ from tonio._colored._net._socket import from_stdlib_socket
 from tonio.colored.net import SocketListener, SocketStream
 from tonio.colored.net.tls import TLSStream
 
-from uvicorn.config import Config
+from uvicorn._ansi import style
+from uvicorn.config import STARTUP_FAILURE, Config
 
 HANDLED_SIGNALS: tuple[int, ...] = (
     signal.SIGINT,
@@ -106,11 +106,11 @@ class Server:
         import toncorn as _toncorn
 
         banner = "toncorn %s (uvicorn %s)" % (_toncorn.__version__, _toncorn.uvicorn_version)
-        color_banner = click.style(banner, bold=True)
+        color_banner = style(banner, bold=True)
         logger.info(banner, extra={"color_message": color_banner})
 
         message = "Started server process [%d]"
-        color_message = "Started server process [" + click.style("%d", fg="cyan") + "]"
+        color_message = "Started server process [" + style("%d", fg="cyan") + "]"
         logger.info(message, process_id, extra={"color_message": color_message})
 
         await self.startup(sockets=sockets)
@@ -127,7 +127,7 @@ class Server:
             if self.started:
                 await self.shutdown()
                 finished = "Finished server process [%d]"
-                color_finished = "Finished server process [" + click.style("%d", fg="cyan") + "]"
+                color_finished = "Finished server process [" + style("%d", fg="cyan") + "]"
                 logger.info(finished, process_id, extra={"color_message": color_finished})
 
         # The signal watcher runs concurrently with main_work so a second SIGINT
@@ -163,8 +163,7 @@ class Server:
     async def startup(self, sockets: list[socket.socket] | None = None) -> None:
         await self.lifespan.startup()
         if self.lifespan.should_exit:
-            self.should_exit = True
-            return
+            sys.exit(STARTUP_FAILURE)
 
         config = self.config
         self._ssl_context = config.ssl
@@ -202,7 +201,7 @@ class Server:
             except OSError as exc:
                 logger.error(exc)
                 await self.lifespan.shutdown()
-                sys.exit(1)
+                sys.exit(STARTUP_FAILURE)
             listener_sockets = [listener.socket._sock for listener in self.listeners]
 
         if sockets is None:
@@ -235,7 +234,7 @@ class Server:
 
             protocol_name = "https" if self._ssl_context is not None else "http"
             message = f"Uvicorn running on {addr_format} (Press CTRL+C to quit)"
-            color_message = "Uvicorn running on " + click.style(addr_format, bold=True) + " (Press CTRL+C to quit)"
+            color_message = "Uvicorn running on " + style(addr_format, bold=True) + " (Press CTRL+C to quit)"
             logger.info(
                 message,
                 protocol_name,

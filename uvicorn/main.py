@@ -20,6 +20,7 @@ from uvicorn.config import (
     LOG_LEVELS,
     LOGGING_CONFIG,
     SSL_PROTOCOL_VERSION,
+    STARTUP_FAILURE,
     Config,
     HTTPProtocolType,
     InterfaceType,
@@ -36,8 +37,6 @@ INTERFACE_CHOICES = click.Choice(INTERFACES)
 def _metavar_from_type(_type: Any) -> str:
     return f"[{'|'.join(key for key in get_args(_type) if key != 'none')}]"
 
-
-STARTUP_FAILURE = 3
 
 logger = logging.getLogger("uvicorn.error")
 
