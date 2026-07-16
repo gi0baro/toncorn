@@ -34,16 +34,30 @@ HANDLED_SIGNALS: tuple[int, ...] = (
 logger = logging.getLogger("uvicorn.error")
 
 
+class Connection:
+    """Bookkeeping for one in-flight connection."""
+
+    __slots__ = ("sock", "idle_since")
+
+    def __init__(self, sock: socket.socket) -> None:
+        #: The underlying stdlib socket.
+        self.sock = sock
+        #: Monotonic timestamp since the handler has been parked waiting for
+        #: the next request head; None while a request is in flight. Written
+        #: by the HTTP handlers, read by the server's keep-alive watchdog.
+        self.idle_since: float | None = None
+
+
 class ServerState:
     """Shared server state available to all connection handlers."""
 
     def __init__(self) -> None:
         self.total_requests = 0
-        # id(stream) -> underlying stdlib socket for every in-flight connection.
+        # id(stream) -> Connection for every in-flight connection.
         # dict add/del is atomic under free-threaded CPython, so no lock is
-        # needed. Used by handlers for `limit_concurrency` and by Server's
-        # graceful-shutdown drain.
-        self.connections: dict[int, socket.socket] = {}
+        # needed. Used by handlers for `limit_concurrency` and idle tracking,
+        # and by Server's keep-alive watchdog and graceful-shutdown drain.
+        self.connections: dict[int, Connection] = {}
         self.default_headers: list[tuple[bytes, bytes]] = []
 
 
@@ -263,8 +277,7 @@ class Server:
         handler = self.config.http_protocol_class
 
         handler_id = id(stream)
-        raw_sock = stream.socket._sock
-        self.server_state.connections[handler_id] = raw_sock
+        self.server_state.connections[handler_id] = Connection(stream.socket._sock)
         self._all_handlers_done.clear()
 
         wrapped: SocketStream | TLSStream = stream
@@ -301,6 +314,21 @@ class Server:
                 return
 
     async def on_tick(self, counter: int) -> bool:
+        # Keep-alive watchdog: reap connections that have been idle (parked
+        # waiting for the next request head) longer than timeout_keep_alive.
+        # shutdown(), unlike close(), delivers a READ_CLOSED edge to the
+        # poller, so the parked reader wakes up, sees EOF, and unwinds the
+        # connection through its normal cleanup path — close() would silently
+        # drop the fd from the poller's interest set and leak the parked task.
+        timeout_keep_alive = self.config.timeout_keep_alive
+        if timeout_keep_alive and self.server_state.connections:
+            now = time.monotonic()
+            for connection in list(self.server_state.connections.values()):
+                idle_since = connection.idle_since
+                if idle_since is not None and now - idle_since > timeout_keep_alive:
+                    with contextlib.suppress(OSError):
+                        connection.sock.shutdown(socket.SHUT_RDWR)
+
         if counter % 10 == 0:
             current_time = time.time()
             current_date = formatdate(current_time, usegmt=True).encode()
@@ -362,12 +390,15 @@ class Server:
             "Graceful shutdown timeout exceeded; force-closing %d connection(s).",
             remaining,
         )
-        # Closing the underlying stdlib socket makes any blocked
+        # shutdown() on the underlying stdlib socket makes any blocked
         # stream.receive_some / send_all return immediately (EOF or OSError),
-        # so the handler's existing error path unwinds the connection.
-        for raw_sock in list(self.server_state.connections.values()):
+        # so the handler's existing error path unwinds the connection and
+        # closes the socket itself. close() would instead silently remove the
+        # fd from the poller's interest set, leaving parked readers waiting
+        # forever.
+        for connection in list(self.server_state.connections.values()):
             with contextlib.suppress(Exception):
-                raw_sock.close()
+                connection.sock.shutdown(socket.SHUT_RDWR)
         # Give handlers a moment to observe the closed socket and run their
         # finally blocks. Anything still pending after this is abandoned when
         # tonio.run returns.

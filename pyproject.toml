@@ -29,7 +29,7 @@ classifiers = [
 dependencies = [
     "click>=7.0",
     "h11>=0.8",
-    "tonio~=0.7.0",
+    "tonio~=0.8.2",
 ]
 
 [project.optional-dependencies]
@@ -74,7 +74,7 @@ exclude-newer = "7 days"
 
 [tool.uv.exclude-newer-package]
 httptools = "2026-05-26"
-tonio = "2026-06-22"
+tonio = "2026-07-16"
 
 [project.scripts]
 toncorn = "uvicorn.main:main"

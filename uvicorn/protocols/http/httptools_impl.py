@@ -6,6 +6,7 @@ import http
 import logging
 import re
 import socket as _stdlib_socket
+import time
 import urllib.parse
 from typing import Any, Literal
 
@@ -13,7 +14,6 @@ import httptools
 import tonio
 import tonio.colored
 import tonio.colored.time
-from tonio._tonio import get_runtime as _get_tonio_runtime
 from tonio.colored.net.tls import TLSStream
 
 from uvicorn._types import (
@@ -33,7 +33,7 @@ from uvicorn.protocols.utils import (
     get_remote_addr,
     is_ssl,
 )
-from uvicorn.server import ServerState
+from uvicorn.server import Connection, ServerState
 
 HEADER_RE = re.compile(b'[\x00-\x1f\x7f()<>@,;:\\[\\]={} \t\\\\"]')
 HEADER_VALUE_RE = re.compile(b"[\x00-\x08\x0a-\x1f\x7f]")
@@ -53,28 +53,52 @@ logger = logging.getLogger("uvicorn.error")
 access_logger = logging.getLogger("uvicorn.access")
 
 
-async def _recv_with_timeout_plain(
-    stream: Stream, timeout_seconds: float, runtime: Any, expect_data: bool
+async def _recv_plain(
+    stream: Stream, timeout_seconds: float, conn_ref: Connection | None, expect_data: bool
 ) -> bytes | None:
+    """Receive bytes on a plain socket, parking on its own IO registration.
+
+    There is no per-read timeout here (``timeout_seconds`` is unused): while
+    parked, ``conn_ref.idle_since`` is set so the server's keep-alive watchdog
+    can reap the connection by shutting the socket down, which wakes us with
+    an EOF (empty bytes) — never None.
+    """
+    sock = stream.socket
     if expect_data:
         try:
-            return stream.socket._sock.recv(65536, 0)
+            return sock._sock.recv(65536, 0)
         except BlockingIOError, InterruptedError:
             pass
 
-    fd = stream.socket.fileno()
-    event = runtime._io_event_r(fd)
-    await event.waiter(round(timeout_seconds * 1_000_000))
-    if event.is_set():
-        try:
-            return stream.socket._sock.recv(65536, 0)
-        except BlockingIOError, InterruptedError:
-            pass
-    return None
+    if conn_ref is not None:
+        conn_ref.idle_since = time.monotonic()
+    try:
+        while True:
+            # Same arm/clear discipline as tonio's own recv: arm returns None
+            # once readiness is flagged; the flag is only cleared after the
+            # kernel buffer is proven drained (tick-guarded, so an edge that
+            # raced in stays intact).
+            if (waiter := sock._io_arm_r()) is not None:
+                await waiter
+                continue
+            try:
+                data = sock._sock.recv(65536, 0)
+            except BlockingIOError, InterruptedError:
+                sock._io_clear_r()
+                continue
+            if len(data) < 65536:
+                # The buffer was fully drained by this recv. Proactively clear
+                # readiness so the next call parks directly instead of paying
+                # a wasted recv syscall against an empty buffer.
+                sock._io_clear_r()
+            return data
+    finally:
+        if conn_ref is not None:
+            conn_ref.idle_since = None
 
 
-async def _recv_with_timeout_tls(
-    stream: TLSStream, timeout_seconds: float, runtime: Any, expect_data: bool
+async def _recv_tls(
+    stream: TLSStream, timeout_seconds: float, conn_ref: Connection | None, expect_data: bool
 ) -> bytes | None:
     data, ok = await tonio.colored.time.timeout(stream.receive_some(), timeout_seconds)
     return data if ok else None
@@ -87,13 +111,13 @@ async def handle(
     app_state: dict[str, Any],
 ) -> None:
     if isinstance(stream, TLSStream):
-        _recv_with_timeout = _recv_with_timeout_tls
+        _recv = _recv_tls
         try:
             stream.transport.socket.setsockopt(_stdlib_socket.IPPROTO_TCP, _stdlib_socket.TCP_NODELAY, 1)
         except OSError, NameError:
             pass
     else:
-        _recv_with_timeout = _recv_with_timeout_plain
+        _recv = _recv_plain
         try:
             stream.socket.setsockopt(_stdlib_socket.IPPROTO_TCP, _stdlib_socket.TCP_NODELAY, 1)
         except OSError, NameError:
@@ -105,7 +129,10 @@ async def handle(
     cb.parser = parser
 
     access_log = access_logger.hasHandlers()
-    runtime = _get_tonio_runtime()
+    # The server registers the raw (pre-TLS-wrap) stream, so this is None for
+    # TLS connections and direct handler invocations (tests) — both of which
+    # don't rely on the keep-alive watchdog.
+    conn_ref = server_state.connections.get(id(stream))
     expect_data = True
 
     while True:
@@ -114,8 +141,8 @@ async def handle(
         # have already populated dispatch_queue — in that case we skip the
         # read entirely.
         while not cb.dispatch_queue:
-            data = await _recv_with_timeout(stream, config.timeout_keep_alive, runtime, expect_data)
-            if not data:  # EOF
+            data = await _recv(stream, config.timeout_keep_alive, conn_ref, expect_data)
+            if not data:  # EOF, watchdog reap, or TLS keep-alive timeout
                 return
             try:
                 parser.feed_data(data)

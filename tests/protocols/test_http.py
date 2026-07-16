@@ -25,13 +25,16 @@ from uvicorn.server import ServerState
 pytestmark = pytest.mark.tonio
 
 
-async def _recv_with_timeout(stream, timeout_seconds, runtime, expect_data):
+# The real `_recv_plain` parks on the socket's poller registration, which the
+# in-memory FakeSocketStream doesn't have. Substitute a timed receive_some so
+# the fake-driven tests still exercise handle()'s no-data/close path.
+async def _recv_patched(stream, timeout_seconds, conn_ref, expect_data):
     data, ok = await tonio.colored.time.timeout(stream.receive_some(), timeout_seconds)
     return data if ok else None
 
 
-httptools_impl._recv_with_timeout_plain = _recv_with_timeout
-h11_impl._recv_with_timeout_plain = _recv_with_timeout
+httptools_impl._recv_plain = _recv_patched
+h11_impl._recv_plain = _recv_patched
 
 
 # ---------------------------------------------------------------------------

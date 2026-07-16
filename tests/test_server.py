@@ -4,6 +4,7 @@ import contextvars
 import json
 import logging
 import socket
+import time
 from typing import Any
 
 import httpx
@@ -60,6 +61,30 @@ async def test_shutdown_on_early_exit_during_startup(unused_tcp_port: int):
 
     assert seen["startup"]
     assert seen["shutdown"], "lifespan.shutdown should run even on early exit"
+
+
+async def test_keepalive_watchdog_closes_idle_connection(unused_tcp_port: int, http_protocol_cls: Any):
+    """An idle keep-alive connection is reaped by the server's watchdog."""
+    config = Config(app=_ok_app, port=unused_tcp_port, http=http_protocol_cls, timeout_keep_alive=0.3)
+    async with run_server(config):
+        s = socket.socket()
+        s.settimeout(5.0)
+        s.connect(("127.0.0.1", unused_tcp_port))
+        try:
+            s.sendall(SIMPLE_GET_REQUEST)
+            response = s.recv(65536)
+            assert b"HTTP/1.1 200 OK" in response
+            # The connection stays open (keep-alive). The watchdog should shut
+            # it down after ~timeout_keep_alive, observed here as EOF.
+            start = time.monotonic()
+            while True:
+                chunk = s.recv(65536)
+                if chunk == b"":
+                    break
+            elapsed = time.monotonic() - start
+        finally:
+            s.close()
+    assert 0.2 <= elapsed < 4.0, elapsed
 
 
 def test_load_app_exits_with_startup_failure_on_unloadable_app() -> None:
