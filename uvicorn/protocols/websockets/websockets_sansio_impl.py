@@ -76,6 +76,7 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
         self.handshake_initiated = False
         self.handshake_complete = False
         self.close_sent = False
+        self.disconnected = False
         self.initial_response: tuple[int, list[tuple[str, str]], bytes] | None = None
 
         extensions = []
@@ -134,6 +135,7 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
             self.logger.log(TRACE_LOG_LEVEL, "%sWebSocket connection lost", prefix)
 
         self.handshake_complete = True
+        self.disconnected = True
         # Unblock any send() awaiting writable: asyncio never calls resume_writing() on a
         # transport that is lost while paused, and the buffer will never drain now.
         self.writable.set()
@@ -394,6 +396,9 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
 
     async def send(self, message: ASGISendEvent) -> None:
         await self.writable.wait()
+
+        if self.disconnected:
+            raise ClientDisconnected()
 
         if not self.handshake_complete and self.initial_response is None:
             if message["type"] == "websocket.accept":
