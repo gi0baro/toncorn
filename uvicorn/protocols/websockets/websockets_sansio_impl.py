@@ -77,6 +77,8 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
         self.handshake_complete = False
         self.close_sent = False
         self.disconnected = False
+        self.close_timer: TimerHandle | None = None
+        self.close_timeout = 10.0
         self.initial_response: tuple[int, list[tuple[str, str]], bytes] | None = None
 
         extensions = []
@@ -139,6 +141,9 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
         # Unblock any send() awaiting writable: asyncio never calls resume_writing() on a
         # transport that is lost while paused, and the buffer will never drain now.
         self.writable.set()
+        if self.close_timer is not None:
+            self.close_timer.cancel()
+            self.close_timer = None
         if exc is None:
             self.transport.close()
 
@@ -159,6 +164,12 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
 
     def shutdown(self) -> None:
         self.stop_keepalive()
+        if self.close_sent:
+            if self.close_timer is not None:
+                self.close_timer.cancel()
+                self.close_timer = None
+            self.transport.close()
+            return
         if self.handshake_complete:
             self.queue.put_nowait({"type": "websocket.disconnect", "code": 1012})
             self.conn.send_close(1012)
@@ -266,6 +277,10 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
     def send_receive_event_to_app(self) -> None:
         data = self.frames[0] if len(self.frames) == 1 else b"".join(self.frames)
         self.frames = []
+        if self.close_sent:
+            # The app is past `websocket.close`: discard the message rather than queueing
+            # it, so reads stay active until the peer's close reply arrives.
+            return
         if self.curr_msg_data_type == "text":
             try:
                 self.queue.put_nowait({"type": "websocket.receive", "text": data.decode()})
@@ -346,7 +361,14 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
         self.transport.close()
 
     def handle_close(self, event: Frame) -> None:
-        if not self.close_sent and not self.transport.is_closing():
+        if self.close_sent:
+            # The peer echoed our close frame: the closing handshake is complete.
+            if self.close_timer is not None:
+                self.close_timer.cancel()
+                self.close_timer = None
+                self.transport.close()
+            return
+        if not self.transport.is_closing():
             assert self.conn.close_rcvd is not None
             code = self.conn.close_rcvd.code
             reason = self.conn.close_rcvd.reason
@@ -384,7 +406,8 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
                 self.send_500_response()
             elif result is not None:
                 self.logger.error("ASGI callable should return None, but returned '%s'.", result)
-        self.transport.close()
+        if self.close_timer is None:
+            self.transport.close()
 
     def send_500_response(self) -> None:
         if self.initial_response or self.handshake_complete:
@@ -478,7 +501,10 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
                         output = self.conn.data_to_send()
                         self.transport.write(b"".join(output))
                         self.close_sent = True
-                        self.transport.close()
+                        if self.read_paused:
+                            self.read_paused = False
+                            self.transport.resume_reading()
+                        self.close_timer = self.loop.call_later(self.close_timeout, self.transport.close)
                 else:
                     raise RuntimeError(
                         f"Expected ASGI message 'websocket.send' or 'websocket.close', but got '{message['type']}'."
