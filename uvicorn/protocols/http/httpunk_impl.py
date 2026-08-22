@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import contextvars
 import http
 import logging
@@ -190,7 +191,13 @@ class _ASGIBridge(_BridgeBase):
         # uvicorn's server calls this synchronously on graceful shutdown; bridge to httpunk's
         # async graceful_shutdown (h2 GOAWAY / h1 disable-keep-alive). In-flight requests finish
         # as httpunk keeps driving its own accept loop, which then ends and closes.
-        self.loop.create_task(self.graceful_shutdown())
+        self.loop.create_task(self._graceful_shutdown())
+
+    async def _graceful_shutdown(self) -> None:
+        try:
+            await self.graceful_shutdown()
+        except OSError:  # pragma: no cover - race: the peer's FIN beat the GOAWAY write
+            self.close()
 
     # ----- ASGI bridge -----
 
@@ -252,6 +259,7 @@ class _ASGIBridge(_BridgeBase):
             "started": False,
             "complete": False,
             "aborted": False,
+            "disconnected": False,
             "status": 500,
             "headers": default_headers,
         }
@@ -294,7 +302,8 @@ class _ASGIBridge(_BridgeBase):
                 return {"type": "http.request", "body": chunk, "more_body": True}
             except StopAsyncIteration:
                 return {"type": "http.request", "body": b"", "more_body": False}
-            except Exception:  # pragma: no cover
+            except Exception:  # the stream was reset or the connection lost mid-request
+                st["disconnected"] = True
                 return {"type": "http.disconnect"}
 
         async def send(message: dict[str, Any]) -> None:
@@ -373,18 +382,18 @@ class _ASGIBridge(_BridgeBase):
                     return
 
                 if not st["started"]:
-                    self.logger.error("ASGI callable returned without starting a response.")
-                    await self._send_500(request, default_headers)
+                    if not st["disconnected"]:
+                        self.logger.error("ASGI callable returned without starting a response.")
+                        await self._send_500(request, default_headers)
                 elif stream is not None:
                     if not st["complete"]:  # app returned mid-stream: end the body iterator
                         await stream.put(b"", False)  # pragma: no cover
                 elif not st["complete"]:
-                    # Started but never finished the body: either no body event at all, or the
-                    # app returned inside the deferral tick — its buffered chunk (if any) is
-                    # the whole body, and nothing is on the wire yet.
+                    # Started but never finished the body: matching h11/zttp, an incomplete
+                    # response is an error — truncate the stream instead of fabricating a body.
+                    self.logger.error("ASGI callable returned without completing response.")
                     st["complete"] = True
-                    await request.respond(st["status"], headers=st["headers"], body=pending or b"")
-                    self._access(scope, st["status"])
+                    await self._abort_request(request)
             finally:
                 if not streaming.done():  # tell handle() no streaming response will come
                     streaming.set_result(False)
@@ -449,6 +458,16 @@ class _ASGIBridge(_BridgeBase):
                 scope["http_version"],
                 status,
             )
+
+    async def _abort_request(self, request: Any) -> None:
+        # h2: reset only this stream so sibling streams survive. h1 has no per-request
+        # reset — close the connection, exactly as h11/httptools do on a truncated response.
+        reset = getattr(request, "reset", None)
+        if reset is not None:
+            with contextlib.suppress(Exception):
+                await reset()
+        else:
+            self.close()
 
     async def _send_500(self, request: Any, default_headers: list[tuple[bytes, bytes]]) -> None:
         try:
