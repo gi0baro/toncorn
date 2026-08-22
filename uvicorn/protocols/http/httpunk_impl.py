@@ -163,6 +163,9 @@ class _ASGIBridge(_BridgeBase):
         self.app_state = app_state
         self.ws_protocol_class = config.ws_protocol_class
         self.limit_concurrency = config.limit_concurrency
+        self.timeout_keep_alive = config.timeout_keep_alive
+        self.timeout_keep_alive_task: asyncio.TimerHandle | None = None
+        self._in_flight = 0  # requests of THIS connection being handled (h2 multiplexes)
 
         self.server: tuple[str, int | None] | None = None
         self.client: tuple[str, int] | None = None
@@ -182,10 +185,43 @@ class _ASGIBridge(_BridgeBase):
         self.server = get_local_addr(transport)
         self.client = get_remote_addr(transport)
         self.scheme = "https" if is_ssl(transport) else "http"
+        self._arm_keep_alive()  # a connection that never sends a request is closed too
 
     def connection_lost(self, exc: Exception | None) -> None:
         self.connections.discard(self)
+        self._disarm_keep_alive()
         super().connection_lost(exc)
+
+    def data_received(self, data: bytes) -> None:
+        # Any inbound bytes count as activity: a request head (handle() keeps the timer off
+        # until the response is done) or an idle-connection frame (h2 PING/SETTINGS/
+        # WINDOW_UPDATE), which re-arms a fresh timer — as the h11/zttp protocols do.
+        self._disarm_keep_alive()
+        super().data_received(data)
+        if self._in_flight == 0:
+            self._arm_keep_alive()
+
+    # ----- keep-alive timeout -----
+    # httpunk has no idle timeout of its own (hyper leaves it to the host too), so the
+    # bridge implements uvicorn's `--timeout-keep-alive`: armed whenever this connection
+    # has no request in flight, an expiry closes it (h2: after a GOAWAY, so the client
+    # knows not to send more). The request cycle is the unit: for HTTP/1 that is the one
+    # serialized request; under HTTP/2 it is the set of concurrent streams, so the timer
+    # runs only once the LAST stream has been answered.
+
+    def _arm_keep_alive(self) -> None:
+        if self.timeout_keep_alive_task is None and not self._transport.is_closing():
+            self.timeout_keep_alive_task = self.loop.call_later(self.timeout_keep_alive, self._keep_alive_expired)
+
+    def _disarm_keep_alive(self) -> None:
+        if self.timeout_keep_alive_task is not None:
+            self.timeout_keep_alive_task.cancel()
+            self.timeout_keep_alive_task = None
+
+    def _keep_alive_expired(self) -> None:
+        self.timeout_keep_alive_task = None
+        if self._in_flight == 0 and not self._transport.is_closing():
+            self.loop.create_task(self._graceful_shutdown(then_close=True))
 
     def shutdown(self) -> None:
         # uvicorn's server calls this synchronously on graceful shutdown; bridge to httpunk's
@@ -193,10 +229,13 @@ class _ASGIBridge(_BridgeBase):
         # as httpunk keeps driving its own accept loop, which then ends and closes.
         self.loop.create_task(self._graceful_shutdown())
 
-    async def _graceful_shutdown(self) -> None:
+    async def _graceful_shutdown(self, then_close: bool = False) -> None:
         try:
             await self.graceful_shutdown()
         except OSError:  # pragma: no cover - race: the peer's FIN beat the GOAWAY write
+            self.close()
+            return
+        if then_close:  # an idle connection: nothing to drain, close right behind the GOAWAY
             self.close()
 
     # ----- ASGI bridge -----
@@ -237,9 +276,19 @@ class _ASGIBridge(_BridgeBase):
         }
 
     async def handle(self, request: Any) -> None:
+        self._disarm_keep_alive()
         if self.ws_protocol_class is not None and getattr(request, "is_upgrade", False) and _is_ws_upgrade(request):
             self._upgrade_websocket(request)  # pragma: no cover
             return  # pragma: no cover
+        self._in_flight += 1
+        try:
+            await self._handle(request)
+        finally:
+            self._in_flight -= 1
+            if self._in_flight == 0:
+                self._arm_keep_alive()
+
+    async def _handle(self, request: Any) -> None:
         scope = self._build_scope(request)
         is_h2 = scope["http_version"] == "2"
         default_headers = self._response_default_headers()
@@ -373,12 +422,19 @@ class _ASGIBridge(_BridgeBase):
                 except BaseException:
                     self.logger.error("Exception in ASGI application\n", exc_info=True)
                     st["aborted"] = True  # a still-pending deferred commit must not fire now
-                    if not st["started"]:
-                        await self._send_500(request, default_headers)
-                    else:  # pragma: no cover
-                        if stream is not None:
-                            stream.abort()  # respond() in handle() raises -> transport closed
-                        self.close()
+                    if stream is None:
+                        # Nothing is on the wire yet: the head is only recorded at
+                        # `http.response.start` and written with the body, so — unlike
+                        # h11/httptools — a crash before the body (incl. a deferred first
+                        # chunk still buffered) can still be answered with a proper 500.
+                        # A crash after a completed response leaves nothing to do.
+                        if not st["complete"]:
+                            await self._send_500(request, default_headers)
+                    else:
+                        # Mid-stream: make the peer see a truncated response. The abort
+                        # raises into respond() in handle(), which then resets only this
+                        # stream (h2) or closes the connection (h1).
+                        stream.abort()
                     return
 
                 if not st["started"]:
@@ -429,13 +485,14 @@ class _ASGIBridge(_BridgeBase):
                     # consuming chunks straight from ASGI send() via the handoff. It returns
                     # once the final chunk is flushed — before the next h1 request is read.
                     await request.respond(st["status"], headers=st["headers"], body=stream)
-                except Exception:  # pragma: no cover
+                except Exception:
                     # Mid-stream failure: client gone, or the app crashed and abort()ed the
-                    # body. httpunk already closed the transport; release a parked producer
-                    # (further sends no-op, as h11/httptools do on disconnect) and let the
-                    # app task run to completion below.
+                    # body. Release a parked producer (further sends no-op, as h11/httptools
+                    # do on disconnect), truncate just this request — RST_STREAM on h2 so
+                    # sibling streams survive; h1 has already closed the transport — and
+                    # let the app task run to completion below.
                     stream.abort()  # type: ignore[union-attr]
-                    self.close()
+                    await self._abort_request(request)
             await task
         except BaseException:  # pragma: no cover
             # handle() dying for any other reason (e.g. cancelled on h2 connection failure /

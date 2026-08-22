@@ -88,7 +88,7 @@ class WireH2Client:
         """Read frames until the peer goes quiet, the connection closes, or
         `timeout` elapses between reads."""
         events: list[Any] = []
-        with contextlib.suppress(TimeoutError):
+        with contextlib.suppress(asyncio.TimeoutError):
             while data := await asyncio.wait_for(self.reader.read(65536), timeout):
                 self.conn.receive_data(data)
                 while (event := self.conn.next_event()) is not zttp.NEED_DATA:
@@ -343,6 +343,130 @@ async def test_no_response_returns_500(http2_protocol_cls: type[asyncio.Protocol
 
 
 @skip_if_no_httpunk
+async def test_app_exception_after_start_before_body(http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int):
+    """A crash between `http.response.start` and the body (here: ASGI misuse, a second
+    start) must not take the connection down: the stream fails alone, siblings work."""
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        if cast("HTTPScope", scope)["path"] == "/boom":
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="critical")
+    async with run_server(config):
+        async with _h2_connection(unused_tcp_port) as conn:
+            with contextlib.suppress(Exception):  # zttp resets the stream; httpunk answers 500
+                response = await conn.request("GET", "/boom", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
+                assert response.status == 500
+            response = await conn.request("GET", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
+            body = await response.read()
+    assert (response.status, body) == (200, b"ok")
+
+
+@skip_if_no_httpunk
+async def test_app_exception_mid_stream_fails_only_its_stream(
+    http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int
+):
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        if cast("HTTPScope", scope)["path"] == "/boom":
+            await send({"type": "http.response.body", "body": b"partial", "more_body": True})
+            await asyncio.sleep(0.05)  # genuinely streaming: the first chunk is on the wire
+            raise RuntimeError("boom")
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="critical")
+    async with run_server(config):
+        async with _h2_connection(unused_tcp_port) as conn:
+            response = await conn.request("GET", "/boom", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
+            assert response.status == 200
+            with pytest.raises(Exception):  # truncated by RST_STREAM  # noqa: B017
+                await response.read()
+            response = await conn.request("GET", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
+            body = await response.read()
+    assert (response.status, body) == (200, b"ok")
+
+
+@skip_if_no_httpunk
+async def test_client_disconnect_mid_upload_disconnects_the_app(
+    http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int
+):
+    disconnected = asyncio.Event()
+    uploading = asyncio.Event()
+    gone = asyncio.Event()
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        assert scope["type"] == "http"
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                disconnected.set()
+                return
+            uploading.set()
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"x" * 1024
+        yield b"x" * 1024  # httpunk's sender holds one chunk back: the first is flushed by the second
+        await gone.wait()
+
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config):
+        from httpunk.asyncio import H2ClientProtocol
+
+        loop = asyncio.get_event_loop()
+        transport, proto = await loop.create_connection(
+            lambda: H2ClientProtocol(authority=f"127.0.0.1:{unused_tcp_port}", scheme="http"),
+            "127.0.0.1",
+            unused_tcp_port,
+        )
+        conn = await proto.ready()
+        task = asyncio.ensure_future(conn.request("POST", "/", headers={"host": "x"}, body=body()))
+        await uploading.wait()
+        transport.abort()
+        gone.set()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+        await asyncio.wait_for(disconnected.wait(), 2)
+
+
+@skip_if_no_httpunk
+async def test_keep_alive_timeout_closes_idle_h2_connection(
+    http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int
+):
+    app = Response("Hello, world", media_type="text/plain")
+    config = Config(
+        app=app,
+        loop="asyncio",
+        port=unused_tcp_port,
+        http=http2_protocol_cls,
+        log_level="warning",
+        timeout_keep_alive=1,
+    )
+    async with run_server(config):
+        from httpunk.asyncio import H2ClientProtocol
+
+        loop = asyncio.get_event_loop()
+        transport, proto = await loop.create_connection(
+            lambda: H2ClientProtocol(authority=f"127.0.0.1:{unused_tcp_port}", scheme="http"),
+            "127.0.0.1",
+            unused_tcp_port,
+        )
+        conn = await proto.ready()
+        response = await conn.request("GET", "/", headers={"host": "x"})
+        assert await response.read() == b"Hello, world"
+        # Idle now: the server must GOAWAY + close by itself within the timeout; the
+        # client marks the connection `closed` on either.
+        for _ in range(60):
+            if conn.closed:
+                break
+            await asyncio.sleep(0.05)
+        assert conn.closed
+        await proto.aclose()
+
+
+@skip_if_no_httpunk
 async def test_connection_specific_response_headers_are_stripped(
     http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int
 ):
@@ -469,6 +593,53 @@ async def test_partial_response_resets_stream(http2_protocol_cls: type[asyncio.P
 
 
 @skip_if_no_zttp_h2
+async def test_unexpected_message_after_start_affects_only_its_stream(
+    http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int
+):
+    """ASGI misuse on one stream (a second `http.response.start`) must not take the
+    whole connection down: the stream fails, sibling streams keep working."""
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        if cast("HTTPScope", scope)["path"] == "/boom":
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="critical")
+    async with run_server(config):
+        async with WireH2Client.connect(unused_tcp_port) as wire:
+            bad = wire.request(target=b"/boom")
+            status, _, ended = await wire.read_response(bad.stream_id)
+            assert not (status == 200 and ended)  # a reset or a 500 — never a clean 200
+            good = wire.request(target=b"/")
+            status, body, ended = await wire.read_response(good.stream_id)
+    assert (status, body, ended) == (200, b"ok", True)
+
+
+@skip_if_no_zttp_h2
+async def test_app_exception_mid_stream_resets_only_its_stream(
+    http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int
+):
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        if cast("HTTPScope", scope)["path"] == "/boom":
+            await send({"type": "http.response.body", "body": b"partial", "more_body": True})
+            await asyncio.sleep(0.05)  # genuinely streaming: the first chunk is on the wire
+            raise RuntimeError("boom")
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="critical")
+    async with run_server(config):
+        async with WireH2Client.connect(unused_tcp_port) as wire:
+            bad = wire.request(target=b"/boom")
+            status, _, ended = await wire.read_response(bad.stream_id)
+            assert status == 200 and not ended  # truncated by RST_STREAM
+            good = wire.request(target=b"/")
+            status, body, ended = await wire.read_response(good.stream_id)
+    assert (status, body, ended) == (200, b"ok", True)
+
+
+@skip_if_no_zttp_h2
 async def test_response_shorter_than_content_length_resets_stream(
     http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int
 ):
@@ -549,6 +720,95 @@ async def test_connection_lost_disconnects_the_app(http2_protocol_cls: type[asyn
             await wire.drain_events(timeout=0.1)
             wire.writer.close()
             await asyncio.wait_for(disconnected.wait(), 2)
+
+
+async def _read_eof(reader: asyncio.StreamReader, conn: Any, timeout: float) -> list[Any]:
+    """Read until the peer closes, returning the parsed events; fails on `timeout`."""
+    events: list[Any] = []
+
+    async def read() -> None:
+        while data := await reader.read(65536):
+            conn.receive_data(data)
+            while (event := conn.next_event()) is not zttp.NEED_DATA:
+                events.append(event)
+
+    await asyncio.wait_for(read(), timeout)
+    return events
+
+
+@skip_if_no_zttp_h2
+async def test_client_goaway_closes_idle_connection_on_the_wire(
+    http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int
+):
+    """A client GOAWAY on an idle connection: the server acknowledges with its own
+    GOAWAY and then actually closes the socket, rather than lingering."""
+    app = Response("Hello, world", media_type="text/plain")
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config):
+        async with WireH2Client.connect(unused_tcp_port) as wire:
+            stream = wire.request()
+            status, _, ended = await wire.read_response(stream.stream_id)
+            assert (status, ended) == (200, True)
+            wire.send_frame(0x07, 0, 0, (0).to_bytes(4, "big") + (0).to_bytes(4, "big"))  # GOAWAY(0, NO_ERROR)
+            events = await _read_eof(wire.reader, wire.conn, timeout=2)
+            assert any(isinstance(event, zttp.GoAway) for event in events)
+
+
+@skip_if_no_zttp_h2
+async def test_keep_alive_timeout_closes_idle_connection_on_the_wire(
+    http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int
+):
+    app = Response("Hello, world", media_type="text/plain")
+    config = Config(
+        app=app,
+        loop="asyncio",
+        port=unused_tcp_port,
+        http=http2_protocol_cls,
+        log_level="warning",
+        timeout_keep_alive=1,
+    )
+    async with run_server(config):
+        async with WireH2Client.connect(unused_tcp_port) as wire:
+            stream = wire.request()
+            status, _, ended = await wire.read_response(stream.stream_id)
+            assert (status, ended) == (200, True)
+            # Idle now: the server must GOAWAY and close by itself within the timeout.
+            events = await _read_eof(wire.reader, wire.conn, timeout=3)
+            assert any(isinstance(event, zttp.GoAway) for event in events)
+
+
+@skip_if_no_zttp_h2
+async def test_keep_alive_timeout_waits_for_in_flight_streams(
+    http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int
+):
+    """The timer only runs while NO stream is in flight: a slow stream outliving the
+    timeout must not get its connection closed under it."""
+    release = asyncio.Event()
+
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
+        if cast("HTTPScope", scope)["path"] == "/slow":
+            await release.wait()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    config = Config(
+        app=app,
+        loop="asyncio",
+        port=unused_tcp_port,
+        http=http2_protocol_cls,
+        log_level="warning",
+        timeout_keep_alive=1,
+    )
+    async with run_server(config):
+        async with WireH2Client.connect(unused_tcp_port) as wire:
+            slow = wire.request(target=b"/slow")
+            await asyncio.sleep(1.5)  # longer than the keep-alive timeout
+            fast = wire.request(target=b"/")
+            status, body, ended = await wire.read_response(fast.stream_id)
+            assert (status, body, ended) == (200, b"ok", True)  # connection still alive
+            release.set()
+            status, body, ended = await wire.read_response(slow.stream_id)
+            assert (status, body, ended) == (200, b"ok", True)
 
 
 # --- zttp-specific internals ----------------------------------------------------
