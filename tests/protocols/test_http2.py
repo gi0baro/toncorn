@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
-import httpx
+import httpx2
 import pytest
 
 from tests.response import Response
@@ -1136,7 +1136,7 @@ class TestHTTPunk:
 
         config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=HTTPunkH1Protocol, log_level="warning")
         async with run_server(config):
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.get(f"http://127.0.0.1:{unused_tcp_port}/")
         assert response.status_code == 204
         assert response.text == ""
@@ -1237,7 +1237,7 @@ class TestHTTPunk:
         )
         try:
             async with run_server(config):
-                async with httpx.AsyncClient() as client:
+                async with httpx2.AsyncClient() as client:
                     response = await client.get(f"http://127.0.0.1:{unused_tcp_port}/")
         finally:
             access_logger.removeHandler(handler)
@@ -1256,7 +1256,7 @@ class TestHTTPunk:
             app=app, loop="asyncio", port=unused_tcp_port, http=HTTPunkH1Protocol, log_level="warning"
         )
         async with run_server(config) as server:
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 await client.get(f"http://127.0.0.1:{unused_tcp_port}/")
                 await client.get(f"http://127.0.0.1:{unused_tcp_port}/")
         assert server.server_state.total_requests == 2
@@ -1281,7 +1281,7 @@ class TestHTTPunk:
             app=app, loop="asyncio", port=unused_tcp_port, http=HTTPunkH1Protocol, log_level="warning"
         )
         async with run_server(config):
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.post(f"http://127.0.0.1:{unused_tcp_port}/", content=b"request-payload")
         assert response.status_code == 200
         assert response.text == "request-payload"
@@ -1300,7 +1300,7 @@ class TestHTTPunk:
             app=app, loop="asyncio", port=unused_tcp_port, http=HTTPunkH1Protocol, log_level="warning"
         )
         async with run_server(config):
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.get(f"http://127.0.0.1:{unused_tcp_port}/")
         assert response.status_code == 200
         assert response.text == "tick;tock"
@@ -1316,7 +1316,7 @@ class TestHTTPunk:
             app=app, loop="asyncio", port=unused_tcp_port, http=HTTPunkH1Protocol, log_level="warning"
         )
         async with run_server(config):
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.get(f"http://127.0.0.1:{unused_tcp_port}/")
         assert response.status_code == 500
         assert response.text == "Internal Server Error"
@@ -1338,7 +1338,7 @@ class TestHTTPunk:
             app=app, loop="asyncio", port=unused_tcp_port, http=HTTPunkAutoProtocol, log_level="warning"
         )
         async with run_server(config):
-            async with httpx.AsyncClient() as client:
+            async with httpx2.AsyncClient() as client:
                 response = await client.get(f"http://127.0.0.1:{unused_tcp_port}/")
             assert response.text == "http/1.1"
 
