@@ -46,17 +46,6 @@ pytestmark = pytest.mark.anyio
 # --- Implementation-agnostic tests (run against every HTTP/2 protocol) ---------
 
 
-async def _run(app: object, port: int, http_protocol_cls: type[asyncio.Protocol], **config_kwargs: object):
-    config = Config(app=app, loop="asyncio", port=port, http=http_protocol_cls, log_level="warning", **config_kwargs)  # type: ignore[arg-type]
-    return run_server(config)
-
-
-async def _ok_app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:  # pragma: no cover
-    # Only used where uvicorn's concurrency limit replaces the app with its own 503 response.
-    await send({"type": "http.response.start", "status": 200, "headers": []})
-    await send({"type": "http.response.body", "body": b"ok"})
-
-
 @asynccontextmanager
 async def _h2_connection(port: int) -> AsyncIterator[Any]:
     from httpunk.asyncio import H2ClientProtocol
@@ -78,7 +67,8 @@ async def test_get_request(http2_protocol_cls: type[asyncio.Protocol], unused_tc
         await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
         await send({"type": "http.response.body", "body": b"Hello, world"})
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls):
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config):
         async with _h2_connection(unused_tcp_port) as conn:
             response = await conn.request("GET", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
             body = await response.read()
@@ -103,7 +93,10 @@ async def test_request_scope(http2_protocol_cls: type[asyncio.Protocol], unused_
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": body})
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls, root_path="/api"):
+    config = Config(
+        app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning", root_path="/api"
+    )
+    async with run_server(config):
         async with _h2_connection(unused_tcp_port) as conn:
             response = await conn.request("GET", "/items?a=1&b=2", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
             body = await response.read()
@@ -124,7 +117,8 @@ async def test_post_request_body(http2_protocol_cls: type[asyncio.Protocol], unu
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": body})
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls):
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config):
         async with _h2_connection(unused_tcp_port) as conn:
             response = await conn.request(
                 "POST", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"}, body=b"request-payload"
@@ -143,7 +137,8 @@ async def test_streaming_response(http2_protocol_cls: type[asyncio.Protocol], un
         await send({"type": "http.response.body", "body": b"chunk-2", "more_body": True})
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls):
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config):
         async with _h2_connection(unused_tcp_port) as conn:
             response = await conn.request("GET", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
             body = await response.read()
@@ -160,7 +155,8 @@ async def test_destreamed_response(http2_protocol_cls: type[asyncio.Protocol], u
         await send({"type": "http.response.body", "body": b"part-1;", "more_body": True})
         await send({"type": "http.response.body", "body": b"part-2", "more_body": False})
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls):
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config):
         async with _h2_connection(unused_tcp_port) as conn:
             response = await conn.request("GET", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
             body = await response.read()
@@ -180,7 +176,8 @@ async def test_streaming_response_backpressure(http2_protocol_cls: type[asyncio.
         await asyncio.sleep(0.01)
         await send({"type": "http.response.body", "body": b"d" * 1024, "more_body": False})
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls):
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config):
         async with _h2_connection(unused_tcp_port) as conn:
             response = await conn.request("GET", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
             body = await response.read()
@@ -202,7 +199,8 @@ async def test_client_disconnect_mid_stream(http2_protocol_cls: type[asyncio.Pro
         await send({"type": "http.response.body", "body": b"y" * 1024, "more_body": True})
         await send({"type": "http.response.body", "body": b"", "more_body": False})
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls):
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config):
         loop = asyncio.get_event_loop()
         from httpunk.asyncio import H2ClientProtocol
 
@@ -238,7 +236,8 @@ async def test_concurrent_streams(http2_protocol_cls: type[asyncio.Protocol], un
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": http_scope["path"].encode()})
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls) as server:
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config) as server:
         async with _h2_connection(unused_tcp_port) as conn:
 
             async def one(i: int) -> bytes:
@@ -255,7 +254,8 @@ async def test_app_exception_returns_500(http2_protocol_cls: type[asyncio.Protoc
     async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
         raise RuntimeError("boom")
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls):
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config):
         async with _h2_connection(unused_tcp_port) as conn:
             response = await conn.request("GET", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
             body = await response.read()
@@ -269,7 +269,8 @@ async def test_no_response_returns_500(http2_protocol_cls: type[asyncio.Protocol
     async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:
         return
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls):
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config):
         async with _h2_connection(unused_tcp_port) as conn:
             response = await conn.request("GET", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
             await response.read()
@@ -295,7 +296,8 @@ async def test_connection_specific_response_headers_are_stripped(
         )
         await send({"type": "http.response.body", "body": b""})
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls):
+    config = Config(app=app, loop="asyncio", port=unused_tcp_port, http=http2_protocol_cls, log_level="warning")
+    async with run_server(config):
         async with _h2_connection(unused_tcp_port) as conn:
             response = await conn.request("GET", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
             await response.read()
@@ -309,7 +311,20 @@ async def test_connection_specific_response_headers_are_stripped(
 
 @skip_if_no_httpunk
 async def test_limit_concurrency_returns_503(http2_protocol_cls: type[asyncio.Protocol], unused_tcp_port: int):
-    async with await _run(_ok_app, unused_tcp_port, http2_protocol_cls, limit_concurrency=1):
+    async def app(scope: Scope, receive: ASGIReceiveCallable, send: ASGISendCallable) -> None:  # pragma: no cover
+        # Never invoked: the concurrency limit replaces the app with uvicorn's own 503 response.
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    config = Config(
+        app=app,
+        loop="asyncio",
+        port=unused_tcp_port,
+        http=http2_protocol_cls,
+        log_level="warning",
+        limit_concurrency=1,
+    )
+    async with run_server(config):
         async with _h2_connection(unused_tcp_port) as conn:
             response = await conn.request("GET", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
             body = await response.read()
@@ -328,7 +343,15 @@ async def test_reset_contextvars(http2_protocol_cls: type[asyncio.Protocol], unu
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b"ok"})
 
-    async with await _run(app, unused_tcp_port, http2_protocol_cls, reset_contextvars=True):
+    config = Config(
+        app=app,
+        loop="asyncio",
+        port=unused_tcp_port,
+        http=http2_protocol_cls,
+        log_level="warning",
+        reset_contextvars=True,
+    )
+    async with run_server(config):
         async with _h2_connection(unused_tcp_port) as conn:
             response = await conn.request("GET", "/", headers={"host": f"127.0.0.1:{unused_tcp_port}"})
             await response.read()
