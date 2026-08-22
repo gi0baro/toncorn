@@ -307,7 +307,12 @@ class _ASGIBridge(_BridgeBase):
                 st["status"] = message["status"]
                 headers = default_headers + list(message.get("headers", []))
                 if is_h2:
-                    headers = [h for h in headers if h[0].lower() not in _H2_ILLEGAL_HEADERS]
+                    headers = [
+                        (name, value)
+                        for name, value in headers
+                        if name.lower() not in _H2_ILLEGAL_HEADERS
+                        and (name.lower() != b"te" or value.lower().strip() == b"trailers")
+                    ]
                 st["headers"] = headers
                 return
             if st["complete"]:

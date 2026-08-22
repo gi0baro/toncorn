@@ -168,14 +168,12 @@ exclude_lines = [
 "sys_platform != 'win32'" = ["uvicorn/loops/asyncio.py"]
 "not is_installed('zttp')" = ["uvicorn/protocols/http/zttp_impl.py"]
 "not is_installed('zttp') or package_version('zttp') < (0, 0, 13)" = [
-    "tests/protocols/test_http2.py",
     "uvicorn/protocols/http/auto_zttp_impl.py",
     "uvicorn/protocols/http/zttp_h2_impl.py",
 ]
-"not is_installed('httpunk')" = [
-    "tests/protocols/test_httpunk.py",
-    "tests/protocols/test_http2_server.py",
-    "uvicorn/protocols/http/httpunk_impl.py",
+"not is_installed('httpunk')" = ["uvicorn/protocols/http/httpunk_impl.py"]
+"not is_installed('httpunk') or not is_installed('zttp') or package_version('zttp') < (0, 0, 13)" = [
+    "tests/protocols/test_http2.py",
 ]
 
 [tool.coverage.coverage_conditional_plugin.rules]
